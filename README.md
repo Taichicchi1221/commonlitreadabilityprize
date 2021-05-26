@@ -1,1 +1,1 @@
-# commonlitreadabilityprize
+# kaggle commonlitreadabilityprize competition @__Taichicchi__
