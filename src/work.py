@@ -23,7 +23,7 @@ import seaborn as sns
 import torch
 import transformers
 import yaml
-from sklearn.metrics import roc_auc_score
+from sklearn.metrics import mean_squared_error
 from sklearn.model_selection import KFold, StratifiedKFold
 from torch import nn
 from torch.nn import functional as F
@@ -99,7 +99,7 @@ class Transform():
         return self.tokenizer.encode_plus(
             text,
             add_special_tokens=True,
-            max_length=self.tokenizer.model_max_length,
+            max_length=self.CFG["TRANSFORM"]["max_length"],
             truncation=True,
             pad_to_max_length=True,
             return_attention_mask=True,
@@ -253,10 +253,11 @@ class Model(pl.LightningModule):
         )
         return loss
 
-
 # ====================================================
 # DATA MODULE
 # ====================================================
+
+
 class DataModule(pl.LightningDataModule):
     def __init__(
         self,
@@ -307,6 +308,12 @@ class DataModule(pl.LightningDataModule):
                 self.test_transform
             )
 
+    def setup_oof(self):
+        self.oof_dataset = TestDataset(
+            self.valid_texts,
+            self.valid_transform
+        )
+
     def train_dataloader(self):
         return DataLoader(
             self.train_dataset,
@@ -320,6 +327,16 @@ class DataModule(pl.LightningDataModule):
     def val_dataloader(self):
         return DataLoader(
             self.valid_dataset,
+            shuffle=False,
+            batch_size=self.batch_size,
+            num_workers=1,
+            pin_memory=False,
+            drop_last=False
+        )
+
+    def oof_dataloader(self):
+        return DataLoader(
+            self.oof_dataset,
             shuffle=False,
             batch_size=self.batch_size,
             num_workers=1,
@@ -363,6 +380,10 @@ def main(CFG):
             "train.csv"
         )
     )
+    if CFG["BASE"]["DEBUG"]:
+        train_df = train_df.sample(200)
+        CFG["TRAIN"]["epochs"] = 1
+
     train_texts = train_df["excerpt"].values
     train_labels = train_df["target"].values
 
@@ -395,6 +416,23 @@ def main(CFG):
         )
 
         trainer.fit(model, datamodule=dm)
+
+        model.freeze()
+
+        dm.setup_oof()
+        prediction = torch.cat(
+            trainer.predict(model, dm.oof_dataloader())
+        ).detach().cpu().numpy()
+        oof[valid_idx] = prediction
+
+    validation_score = np.sqrt(mean_squared_error(train_df["target"], oof))
+    plt.figure()
+    plt.hist(train_df["target"], alpha=0.5, bins=100)
+    plt.hist(oof, alpha=0.5, bins=100)
+    plt.legend(["ground-truth", "oof"])
+    plt.savefig("oof_plot.png")
+    plt.close()
+    print(f"validation score: {validation_score}")
 
 
 if __name__ == "__main__":
