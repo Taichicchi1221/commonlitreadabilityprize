@@ -12,21 +12,24 @@ import warnings
 from functools import partial
 from pathlib import Path
 
+import hydra
 import matplotlib.pyplot as plt
+import mlflow
 import numpy as np
 import pandas as pd
 import pytorch_lightning as pl
+from yaml import tokens
 import seaborn as sns
 import torch
 import transformers
+import yaml
 from sklearn.metrics import roc_auc_score
-from sklearn.model_selection import StratifiedKFold
+from sklearn.model_selection import KFold, StratifiedKFold
 from torch import nn
 from torch.nn import functional as F
+from torch.optim import optimizer
 from torch.utils.data import DataLoader
-from tqdm.notebook import tqdm
-
-import mlflow
+from tqdm import tqdm
 
 warnings.simplefilter("ignore")
 
@@ -41,120 +44,91 @@ def seed_everything(seed=1234):
     pl.seed_everything(seed)
 
 
-CFG = {
-    "INPUT_DIR": "../input/commonlitreadabilityprize",
-    "SEED": 42,
+def get_config():
+    with open("../config/config.yaml", "r") as f:
+        return yaml.load(f, Loader=yaml.FullLoader)
 
-    "BATCH_SIZE": 64,
-
-    # ['ReduceLROnPlateau', 'CosineAnnealingLR', 'CosineAnnealingWarmRestarts']
-    "SCHEDULER": 'CosineAnnealingLR',
-    "LEARNING_RATE": 1e-4,
-    "MIN_LR": 1e-6,
-    "WEIGHT_DECAY": 1e-6,
-    "FACTOR": 0.2,  # ReduceLROnPlateau
-    "PATIENCE": 4,  # ReduceLROnPlateau
-    "EPS": 1e-6,  # ReduceLROnPlateau
-    "T_MAX": 6,  # CosineAnnealingLR
-    "T_0": 5,  # CosineAnnealingWarmRestarts
-
-    "MODEL_NAME": "",
-    "PRETRAINED": True,
-    "IMAGE_SIZE_0": 224,
-    "IMAGE_SIZE_1": 224,
-
-    "EPOCHS": 6,
-
-    "TARGET_SIZE": 1,
-    "N_FOLD": 4,
-
-    "DEBUG": False,
-}
-
-seed_everything(CFG["SEED"])
+# ====================================================
+# transform
+# ====================================================
 
 
-# In[5]:
+class Transform():
+    def __init__(self, data, CFG):
+        self.CFG = CFG
+        self.data = data
+        self.tokenizer = self.get_tokenizer()
 
+    def __call__(self, text):
+        text = self.clean_text(text)
+        tokens = self.tokenize(text)
 
-train_df = pd.read_csv(Path(CFG["INPUT_DIR"], "train_labels.csv"))
-test_df = pd.read_csv(Path(CFG["INPUT_DIR"], "sample_submission.csv"))
+        return tokens
 
-train_df["file_path"] = train_df["id"].apply(
-    lambda x: Path(CFG["INPUT_DIR"], "train", f"{x[0]}/{x}.npy"))
-test_df["file_path"] = test_df["id"].apply(
-    lambda x: Path(CFG["INPUT_DIR"], "test", f"{x[0]}/{x}.npy"))
-test_df["target"] = 0
+    def clean_text(self, text):
+        '''
+        Converts all text to lower case, Removes special charecters, emojis and multiple spaces
+        text - Sentence that needs to be cleaned
+        '''
+        text = ''.join([k for k in text if k not in string.punctuation])
+        text = re.sub('[^A-Za-z0-9]+', ' ', str(text).lower()).strip()
+        text = re.sub(' +', ' ', text)
+        emoji_pattern = re.compile(
+            "["
+            u"\U0001F600-\U0001F64F"  # emoticons
+            u"\U0001F300-\U0001F5FF"  # symbols & pictographs
+            u"\U0001F680-\U0001F6FF"  # transport & map symbols
+            u"\U0001F1E0-\U0001F1FF"  # flags (iOS)
+            "]+",
+            flags=re.UNICODE
+        )
+        text = emoji_pattern.sub(r'', text)
+        return text
 
-print(f"train images = {len(train_df)}")
-print(f"test images = {len(test_df)}")
+    def get_tokenizer(self):
+        config = transformers.AutoConfig.from_pretrained(
+            self.CFG["MODEL_NAME"]
+        )
+        tokenizer = transformers.AutoTokenizer.from_pretrained(
+            self.CFG["MODEL_NAME"],
+            config=config,
+        )
+        return tokenizer
 
-
-# In[6]:
-
-
-# DEBUG?
-if CFG["DEBUG"]:
-    CFG["EPOCHS"] = 3
-    train_df = train_df.sample(1000).reset_index(drop=True)
-    test_df = test_df.sample(1000).reset_index(drop=True)
-
-
-# In[7]:
+    def tokenize(self, text):
+        return self.tokenizer.encode_plus(
+            text,
+            add_special_tokens=True,
+            max_length=self.tokenizer.model_max_length,
+            truncation=True,
+            pad_to_max_length=True,
+            return_attention_mask=True,
+        )
 
 
 # ====================================================
-# Transforms
+# optimizer, scheduler
 # ====================================================
 
-def read_image(file_path):
-    image = np.load(file_path)  # (6, 273, 256)
-    image = image.astype(np.float32)
-    image = np.concatenate(image, axis=0).transpose(
-        (1, 0))  # (1638, 256) -> (256, 1638)
-    return image
+
+def get_optimizer(model, CFG):
+    optimizer_name = CFG["OPTIMIZER"]["name"]
+    optimizer_params = CFG["OPTIMIZER"][f"params_{CFG['OPTIMIZER']['name']}"]
+    optimizer = getattr(
+        torch.optim,
+        optimizer_name
+    )(model.parameters(), **optimizer_params)
+    return optimizer
 
 
-def get_transform(*, data):
-    if data == "train":
-        return A.Compose([
-            A.Resize(CFG["IMAGE_SIZE_0"], CFG["IMAGE_SIZE_1"]),
-            ToTensorV2(),
-        ])
-
-    elif data == "valid":
-        return A.Compose([
-            A.Resize(CFG["IMAGE_SIZE_0"], CFG["IMAGE_SIZE_1"]),
-            ToTensorV2(),
-        ])
-
-    elif data == "test":
-        return A.Compose([
-            A.Resize(CFG["IMAGE_SIZE_0"], CFG["IMAGE_SIZE_1"]),
-            ToTensorV2(),
-        ])
-
-
-# In[8]:
-
-
-# ====================================================
-# scheduler
-# ====================================================
-def get_scheduler(optimizer):
-    if CFG["SCHEDULER"] == 'ReduceLROnPlateau':
-        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-            optimizer, mode='min', factor=CFG["FACTOR"], patience=CFG["PATIENCE"], verbose=True, eps=CFG["EPS"])
-    elif CFG["SCHEDULER"] == 'CosineAnnealingLR':
-        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-            optimizer, T_max=CFG["T_MAX"], eta_min=CFG["MIN_LR"], last_epoch=-1)
-    elif CFG["SCHEDULER"] == 'CosineAnnealingWarmRestarts':
-        scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
-            optimizer, T_0=CFG["T_0"], T_mult=1, eta_min=CFG["MIN_LR"], last_epoch=-1)
+def get_scheduler(optimizer, CFG):
+    scheduler_name = CFG["SCHEDULER"]["name"]
+    scheduler_params = CFG["SCHEDULER"][f"params_{CFG['SCHEDULER']['name']}"]
+    scheduler = getattr(
+        torch.optim.lr_scheduler,
+        scheduler_name
+    )(optimizer, **scheduler_params)
     return scheduler
-
-
-# In[9]:
 
 
 # ====================================================
@@ -163,10 +137,12 @@ def get_scheduler(optimizer):
 class DatasetBase(torch.utils.data.Dataset):
     def __init__(
         self,
-        file_paths,
+        texts,
+        transform
     ):
-        self.file_paths = file_paths
-        self.length = len(file_paths)
+        self.texts = texts
+        self.transform = transform
+        self.length = len(texts)
 
     def __len__(
         self,
@@ -177,81 +153,82 @@ class DatasetBase(torch.utils.data.Dataset):
         self,
         idx
     ):
-        file_path = self.file_paths[idx]
-        image = read_image(file_path)
+        if self.transform:
+            text = self.transform(self.texts[idx])
+            text = {
+                k: torch.tensor(v, dtype=torch.long) for k, v in text.items()
+            }
 
-        return image
+        return text
 
 
 class Dataset(DatasetBase):
     def __init__(
         self,
-        file_paths,
+        texts,
         labels,
         transform,
     ):
-        super().__init__(file_paths)
+        super().__init__(texts, transform)
         self.labels = labels
-        self.transform = transform
 
     def __getitem__(
         self,
         idx,
     ):
-        image = super().__getitem__(idx)
-        image = self.transform(image=image)["image"]
+        text = super().__getitem__(idx)
         label = torch.tensor(self.labels[idx]).float()
 
-        return image, label
+        return text, label
 
 
 class TestDataset(DatasetBase):
     def __init__(
         self,
-        file_paths,
-        transform=None,
+        texts,
+        transform,
     ):
-        super().__init__(file_paths)
-        self.transform = transform
+        super().__init__(texts, transform)
 
     def __getitem__(
         self,
         idx,
     ):
-        image = super().__getitem__(idx)
-        image = self.transform(image=image)["image"]
+        text = super().__getitem__(idx)
 
-        return image
-
-
-# In[10]:
+        return text
 
 
 # ====================================================
 # MODEL
 # ====================================================
 class Model(pl.LightningModule):
-    def __init__(self, model_name, pretrained=False):
+    def __init__(
+        self,
+        CFG
+    ):
         super().__init__()
-        self.model = timm.create_model(
-            model_name, pretrained=pretrained, in_chans=1)
-        self.n_features = self.model.classifier.in_features
-        self.model.classifier = nn.Linear(self.n_features, CFG["TARGET_SIZE"])
+        self.CFG = CFG
+        self.model = transformers.AutoModelForSequenceClassification.from_pretrained(
+            CFG["MODEL_NAME"]
+        )
+        self.model.classifier = torch.nn.Linear(
+            self.model.classifier.in_features, 1
+        )
 
     def forward(self, x):
-        output = self.model(x)
-        return output
+        output = self.model(**x)
+        return output.logits.flatten()
 
     def configure_optimizers(self):
-        optimizer = torch.optim.Adam(
-            self.parameters(), lr=CFG["LEARNING_RATE"])
-        scheduler = get_scheduler(optimizer)
+        optimizer = get_optimizer(self, self.CFG)
+        scheduler = get_scheduler(optimizer, self.CFG)
         return [optimizer], [scheduler]
 
     def training_step(self, batch, batch_idx):
         x, y = batch
-        y_hat = self(x).flatten()
-        loss = F.binary_cross_entropy_with_logits(y_hat, y)
+        y_hat = self(x)
+        loss = torch.sqrt(F.mse_loss(y_hat, y))
         self.log(
             'train_loss',
             loss,
@@ -260,12 +237,12 @@ class Model(pl.LightningModule):
             prog_bar=True,
             logger=True
         )
-        return {"loss": loss, "y_hat": y_hat, "target": y}
+        return loss
 
     def validation_step(self, batch, batch_idx):
         x, y = batch
-        y_hat = self(x).flatten()
-        loss = F.binary_cross_entropy_with_logits(y_hat, y)
+        y_hat = self(x)
+        loss = torch.sqrt(F.mse_loss(y_hat, y))
         self.log(
             'valid_loss',
             loss,
@@ -274,29 +251,7 @@ class Model(pl.LightningModule):
             prog_bar=True,
             logger=True
         )
-        return {"loss": loss, "y_hat": y_hat, "target": y}
-
-    def validation_epoch_end(self, outputs):
-        avg_loss = torch.stack([out['loss'] for out in outputs], dim=0).mean()
-        predictions = torch.sigmoid(
-            torch.cat([out['y_hat'] for out in outputs], dim=0)).detach().cpu().numpy()
-
-        self.valid_predictions = predictions
-        return {'valid_loss': avg_loss}
-
-    def test_step(self, batch, batch_idx):
-        y_hat = self(batch).flatten()
-        return {"y_hat": y_hat}
-
-    def test_epoch_end(self, outputs):
-        predictions = torch.sigmoid(
-            torch.cat([out['y_hat'] for out in outputs], dim=0)).detach().cpu().numpy()
-        self.test_predictions = predictions
-        # We need to return something
-        return {'dummy_item': 0}
-
-
-# In[11]:
+        return loss
 
 
 # ====================================================
@@ -305,9 +260,9 @@ class Model(pl.LightningModule):
 class DataModule(pl.LightningDataModule):
     def __init__(
         self,
-        train_file_paths,
-        valid_file_paths,
-        test_file_paths,
+        train_texts,
+        valid_texts,
+        test_texts,
         train_labels,
         valid_labels,
         test_labels,
@@ -317,9 +272,9 @@ class DataModule(pl.LightningDataModule):
         batch_size,
     ):
         super(DataModule, self).__init__()
-        self.train_file_paths = train_file_paths
-        self.valid_file_paths = valid_file_paths
-        self.test_file_paths = test_file_paths
+        self.train_texts = train_texts
+        self.valid_texts = valid_texts
+        self.test_texts = test_texts
         self.train_labels = train_labels
         self.valid_labels = valid_labels
         self.test_labels = test_labels
@@ -336,19 +291,19 @@ class DataModule(pl.LightningDataModule):
     def setup(self, stage=None):
         if stage == 'fit' or stage is None:
             self.train_dataset = Dataset(
-                self.train_file_paths,
+                self.train_texts,
                 self.train_labels,
                 self.train_transform
             )
             self.valid_dataset = Dataset(
-                self.valid_file_paths,
+                self.valid_texts,
                 self.valid_labels,
                 self.valid_transform,
             )
 
         if stage == 'test' or stage is None:
             self.test_dataset = TestDataset(
-                self.test_file_paths,
+                self.test_texts,
                 self.test_transform
             )
 
@@ -357,8 +312,8 @@ class DataModule(pl.LightningDataModule):
             self.train_dataset,
             shuffle=True,
             batch_size=self.batch_size,
-            num_workers=os.cpu_count(),
-            pin_memory=True,
+            num_workers=1,
+            pin_memory=False,
             drop_last=True
         )
 
@@ -367,8 +322,8 @@ class DataModule(pl.LightningDataModule):
             self.valid_dataset,
             shuffle=False,
             batch_size=self.batch_size,
-            num_workers=os.cpu_count(),
-            pin_memory=True,
+            num_workers=1,
+            pin_memory=False,
             drop_last=False
         )
 
@@ -377,158 +332,72 @@ class DataModule(pl.LightningDataModule):
             self.test_dataset,
             shuffle=False,
             batch_size=self.batch_size,
-            num_workers=os.cpu_count(),
-            pin_memory=True,
+            num_workers=1,
+            pin_memory=False,
             drop_last=False
         )
 
+# %%
 
-# In[12]:
+
+def detect_device():
+    import torch
+    if torch.cuda.is_available():
+        return {"gpus": 1, "precision": 16}
+    return {"precision": 32}
 
 
-skf = StratifiedKFold(CFG["N_FOLD"], shuffle=True, random_state=CFG["SEED"])
+CONFIG_PATH = "../config/config.yaml"
 
-oof_predictions = np.zeros(len(train_df))
-predictions = np.zeros(len(test_df))
 
-for fold, (train_idx, valid_idx) in enumerate(skf.split(train_df["file_path"], train_df["target"])):
-    print("#" * 30, f"fold{fold}", "#" * 30)
-    train_file_paths = np.array(train_df["file_path"])[train_idx]
-    valid_file_paths = np.array(train_df["file_path"])[valid_idx]
-    train_labels = np.array(train_df["target"])[train_idx]
-    valid_labels = np.array(train_df["target"])[valid_idx]
+@hydra.main(config_path=CONFIG_PATH)
+def main(CFG):
+    # device
+    device_params = detect_device()
 
-    test_file_paths = test_df["file_path"]
-
-    model = Model(
-        CFG["MODEL_NAME"],
-        pretrained=CFG["PRETRAINED"],
+    # prepare df
+    train_df = pd.read_csv(
+        os.path.join(
+            hydra.utils.get_original_cwd(),
+            CFG["IO"]["INPUT_DIR"],
+            "train.csv"
+        )
     )
-    dm = DataModule(
-        train_file_paths=train_file_paths,
-        valid_file_paths=valid_file_paths,
-        test_file_paths=test_file_paths,
-        train_labels=train_labels,
-        valid_labels=valid_labels,
-        test_labels=None,
-        train_transform=get_transform(data="train"),
-        valid_transform=get_transform(data="valid"),
-        test_transform=get_transform(data="test"),
-        batch_size=CFG["BATCH_SIZE"],
+    train_texts = train_df["excerpt"].values
+    train_labels = train_df["target"].values
+
+    # train
+    oof = np.zeros(train_labels.shape)
+    kf = KFold(
+        CFG["TRAIN"]["n_fold"],
+        shuffle=True,
+        random_state=CFG["TRAIN"]["shuffle_seed"],
     )
+    for fold, (train_idx, valid_idx) in enumerate(kf.split(train_df)):
+        print("#" * 30, f"fold: {fold}", "#" * 30)
+        model = Model(CFG)
+        dm = DataModule(
+            train_texts=train_texts[train_idx],
+            valid_texts=train_texts[valid_idx],
+            test_texts=None,
+            train_labels=train_labels[train_idx],
+            valid_labels=train_labels[valid_idx],
+            test_labels=None,
+            train_transform=Transform("train", CFG),
+            valid_transform=Transform("valid", CFG),
+            test_transform=Transform("test", CFG),
+            batch_size=CFG["TRAIN"]["batch_size"]
+        )
 
-    checkpoint_callback = pl.callbacks.ModelCheckpoint(
-        f"fold{fold}_{CFG['MODEL_NAME']}",
-        monitor='valid_loss',
-        mode='min',
-        save_top_k=1,
-    )
+        trainer = pl.Trainer(
+            **device_params,
+            max_epochs=CFG["TRAIN"]["epochs"]
+        )
 
-    trainer = pl.Trainer(
-        max_epochs=CFG["EPOCHS"],
-        gpus=1,
-        precision=16,
-        deterministic=False,
-        benchmark=True,
-        checkpoint_callback=checkpoint_callback
-    )
-
-    trainer.fit(model, datamodule=dm)
-    trainer.test(model, datamodule=dm, ckpt_path="best")
-
-    oof_predictions[valid_idx] += model.valid_predictions
-    predictions += model.test_predictions / CFG["N_FOLD"]
-
-
-# In[13]:
+        trainer.fit(model, datamodule=dm)
 
 
-valid_score = roc_auc_score(train_df["target"], oof_predictions)
-valid_score_name = str(valid_score).split('.')[1][:4]
-print(f"validation score: {valid_score}")
+if __name__ == "__main__":
+    main()
 
-
-# In[14]:
-
-
-oof_df = train_df.copy()
-oof_df.rename(columns={"target": "ground_truth"}, inplace=True)
-oof_df["target"] = oof_predictions
-oof_df[["id", "target"]].to_csv(
-    f"oof_{CFG['MODEL_NAME']}_{valid_score_name}.csv", index=False)
-
-
-# In[15]:
-
-
-test_df["target"] = predictions
-test_df[["id", "target"]].to_csv(
-    f"submission_{CFG['MODEL_NAME']}_{valid_score_name}.csv", index=False)
-
-
-# In[16]:
-
-
-oof_df["target"].plot.hist(bins=100)
-
-
-# In[17]:
-
-
-oof_df["pred_class"] = (oof_df["target"] > 0.5).astype("int")
-oof_df["is_false"] = (oof_df["pred_class"] ^ oof_df["ground_truth"])
-false_list = list(
-    zip(
-        oof_df.loc[(oof_df["is_false"] == 1) & (
-            oof_df["ground_truth"] == 0), "id"].to_list(),
-        oof_df.loc[(oof_df["is_false"] == 1) & (
-            oof_df["ground_truth"] == 0), "ground_truth"].to_list(),
-        oof_df.loc[(oof_df["is_false"] == 1) & (
-            oof_df["ground_truth"] == 0), "target"].to_list(),
-    )
-)
-random.shuffle(false_list)
-
-W = 3
-H = 7
-fig = plt.figure(figsize=(30, 20))
-for m, (image_id, ground_truth, target) in enumerate(false_list):
-    if m == H * W:
-        break
-    plt.subplot(H, W, m + 1)
-    plt.title(f"{image_id}, gt={ground_truth}, pred={target:.2f}")
-    plt.imshow(read_image(
-        f"{CFG['INPUT_DIR']}train/{image_id[0]}/{image_id}.npy"))
-plt.show()
-
-
-# In[18]:
-
-
-false_list = list(
-    zip(
-        oof_df.loc[(oof_df["is_false"] == 1) & (
-            oof_df["ground_truth"] == 1), "id"].to_list(),
-        oof_df.loc[(oof_df["is_false"] == 1) & (
-            oof_df["ground_truth"] == 1), "ground_truth"].to_list(),
-        oof_df.loc[(oof_df["is_false"] == 1) & (
-            oof_df["ground_truth"] == 1), "target"].to_list(),
-    )
-)
-random.shuffle(false_list)
-
-fig = plt.figure(figsize=(30, 20))
-for m, (image_id, ground_truth, target) in enumerate(false_list):
-    if m == H * W:
-        break
-    plt.subplot(H, W, m + 1)
-    plt.title(f"{image_id}, gt={ground_truth}, pred={target:.2f}")
-    plt.imshow(read_image(
-        f"{CFG['INPUT_DIR']}train/{image_id[0]}/{image_id}.npy"))
-plt.show()
-
-
-# In[19]:
-
-
-test_df["target"].plot.hist(bins=100)
+# %%

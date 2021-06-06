@@ -1,0 +1,41 @@
+hydra:
+  run:
+    dir: ../logs/outputs/${now:%Y-%m-%d}/${now:%H-%M-%S}
+
+BASE:
+  SEED: 0
+  DEBUG: False
+
+IO:
+  INPUT_DIR: ../input/commonlitreadabilityprize
+
+TRAIN:
+  n_fold: 5
+  shuffle_seed: 0
+  batch_size: 16
+  epochs: 50
+
+MODEL_NAME: albert-base-v2
+
+OPTIMIZER:
+  name: "Adam" # [Adam, AdamW]
+  params_Adam:
+    lr: 1.0e-04
+    weight_decay: 1.0e-04
+  params_AdamW:
+    lr: 1.0e-04
+    weight_decay: 1.0e-04
+
+SCHEDULER:
+  name: CosineAnnealingWarmRestarts # [ReduceLROnPlateau, CosineAnnealingLR, CosineAnnealingWarmRestarts]
+  params_ReduceLROnPlateau:
+    mode: min
+    factor: 0.2
+    patience: 4
+    eps: 1.0e-06
+  params_CosineAnnealingLR:
+    T_max: 50
+    eta_min: 1.0e-08
+  params_CosineAnnealingWarmRestarts:
+    T_0: 5
+    eta_min: 1.0e-08
