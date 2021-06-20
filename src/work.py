@@ -6,6 +6,7 @@ import pickle
 import random
 import re
 import string
+import shutil
 import sys
 import time
 import warnings
@@ -49,7 +50,7 @@ def get_config():
         return yaml.load(f, Loader=yaml.FullLoader)
 
 # ====================================================
-# transform
+# Transform
 # ====================================================
 
 
@@ -58,12 +59,6 @@ class Transform():
         self.CFG = CFG
         self.data = data
         self.tokenizer = self.get_tokenizer()
-
-    def __call__(self, text):
-        text = self.clean_text(text)
-        tokens = self.tokenize(text)
-
-        return tokens
 
     def clean_text(self, text):
         '''
@@ -105,9 +100,15 @@ class Transform():
             return_attention_mask=True,
         )
 
+    def __call__(self, text):
+        if self.CFG["TRANSFORM"]["text_cleaning"]:
+            text = self.clean_text(text)
+        tokens = self.tokenize(text)
+
+        return tokens
 
 # ====================================================
-# optimizer, scheduler
+# Optimizer, Scheduler
 # ====================================================
 
 
@@ -210,10 +211,8 @@ class Model(pl.LightningModule):
         super().__init__()
         self.CFG = CFG
         self.model = transformers.AutoModelForSequenceClassification.from_pretrained(
-            CFG["MODEL_NAME"]
-        )
-        self.model.classifier = torch.nn.Linear(
-            self.model.classifier.in_features, 1
+            CFG["MODEL_NAME"],
+            num_labels=1,
         )
 
     def forward(self, x):
@@ -433,6 +432,11 @@ def main(CFG):
     plt.savefig("oof_plot.png")
     plt.close()
     print(f"validation score: {validation_score}")
+    f = open(f"val_score: {validation_score}")
+    f.close()
+
+    # copy this script to current directory
+    shutil.copyfile(__file__, os.path.join(".", os.path.basename(__file__)))
 
 
 if __name__ == "__main__":
