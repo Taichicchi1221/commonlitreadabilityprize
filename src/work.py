@@ -9,21 +9,20 @@ import string
 import shutil
 import sys
 import time
+from typing import Callable
 import warnings
 from functools import partial
 from pathlib import Path
 
-import hydra
+from omegaconf import OmegaConf
 import matplotlib.pyplot as plt
 import mlflow
 import numpy as np
 import pandas as pd
 import pytorch_lightning as pl
-from yaml import tokens
 import seaborn as sns
 import torch
 import transformers
-import yaml
 from sklearn.metrics import mean_squared_error
 from sklearn.model_selection import KFold, StratifiedKFold
 from torch import nn
@@ -34,58 +33,22 @@ from tqdm import tqdm
 
 warnings.simplefilter("ignore")
 
-
-def seed_everything(seed=1234):
-    random.seed(seed)
-    os.environ['PYTHONHASHSEED'] = str(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed(seed)
-    torch.backends.cudnn.deterministic = True
-    pl.seed_everything(seed)
-
-
-def get_config():
-    with open("../config/config.yaml", "r") as f:
-        return yaml.load(f, Loader=yaml.FullLoader)
-
 # ====================================================
-# Transform
+# transform
 # ====================================================
 
 
 class Transform():
-    def __init__(self, data, CFG):
-        self.CFG = CFG
+    def __init__(self, data):
         self.data = data
         self.tokenizer = self.get_tokenizer()
 
-    def clean_text(self, text):
-        '''
-        Converts all text to lower case, Removes special charecters, emojis and multiple spaces
-        text - Sentence that needs to be cleaned
-        '''
-        text = ''.join([k for k in text if k not in string.punctuation])
-        text = re.sub('[^A-Za-z0-9]+', ' ', str(text).lower()).strip()
-        text = re.sub(' +', ' ', text)
-        emoji_pattern = re.compile(
-            "["
-            u"\U0001F600-\U0001F64F"  # emoticons
-            u"\U0001F300-\U0001F5FF"  # symbols & pictographs
-            u"\U0001F680-\U0001F6FF"  # transport & map symbols
-            u"\U0001F1E0-\U0001F1FF"  # flags (iOS)
-            "]+",
-            flags=re.UNICODE
-        )
-        text = emoji_pattern.sub(r'', text)
-        return text
-
     def get_tokenizer(self):
         config = transformers.AutoConfig.from_pretrained(
-            self.CFG["MODEL_NAME"]
+            CFG.model.name
         )
         tokenizer = transformers.AutoTokenizer.from_pretrained(
-            self.CFG["MODEL_NAME"],
+            CFG.model.name,
             config=config,
         )
         return tokenizer
@@ -94,46 +57,45 @@ class Transform():
         return self.tokenizer.encode_plus(
             text,
             add_special_tokens=True,
-            max_length=self.CFG["TRANSFORM"]["max_length"],
+            max_length=CFG.tokenizer.max_length,
             truncation=True,
             pad_to_max_length=True,
             return_attention_mask=True,
         )
 
     def __call__(self, text):
-        if self.CFG["TRANSFORM"]["text_cleaning"]:
-            text = self.clean_text(text)
-        tokens = self.tokenize(text)
+        return self.tokenize(text)
 
-        return tokens
+
+def get_transform(data):
+    return Transform(data=data)
+
 
 # ====================================================
-# Optimizer, Scheduler
+# optimizer
 # ====================================================
 
 
-def get_optimizer(model, CFG):
-    optimizer_name = CFG["OPTIMIZER"]["name"]
-    optimizer_params = CFG["OPTIMIZER"][f"params_{CFG['OPTIMIZER']['name']}"]
-    optimizer = getattr(
+def get_optimizer(model):
+    return getattr(
         torch.optim,
-        optimizer_name
-    )(model.parameters(), **optimizer_params)
-    return optimizer
+        CFG.optimizer.name
+    )(model.parameters(), **CFG.optimizer.params)
+
+# ====================================================
+# scheduler
+# ====================================================
 
 
-def get_scheduler(optimizer, CFG):
-    scheduler_name = CFG["SCHEDULER"]["name"]
-    scheduler_params = CFG["SCHEDULER"][f"params_{CFG['SCHEDULER']['name']}"]
-    scheduler = getattr(
+def get_scheduler(optimizer):
+    return getattr(
         torch.optim.lr_scheduler,
-        scheduler_name
-    )(optimizer, **scheduler_params)
-    return scheduler
+        CFG.scheduler.name
+    )(optimizer, **CFG.scheduler.params)
 
 
 # ====================================================
-# Dataset
+# dataset
 # ====================================================
 class DatasetBase(torch.utils.data.Dataset):
     def __init__(
@@ -154,12 +116,11 @@ class DatasetBase(torch.utils.data.Dataset):
         self,
         idx
     ):
+        text = self.texts[idx]
         if self.transform:
-            text = self.transform(self.texts[idx])
-            text = {
-                k: torch.tensor(v, dtype=torch.long) for k, v in text.items()
-            }
-
+            text = self.transform(text)
+            text = {k: torch.tensor(v, dtype=torch.long)
+                    for k, v in text.items()}
         return text
 
 
@@ -179,7 +140,6 @@ class Dataset(DatasetBase):
     ):
         text = super().__getitem__(idx)
         label = torch.tensor(self.labels[idx]).float()
-
         return text, label
 
 
@@ -196,162 +156,151 @@ class TestDataset(DatasetBase):
         idx,
     ):
         text = super().__getitem__(idx)
-
         return text
 
 
 # ====================================================
-# MODEL
+# model
 # ====================================================
 class Model(pl.LightningModule):
     def __init__(
         self,
-        CFG
     ):
         super().__init__()
-        self.CFG = CFG
         self.model = transformers.AutoModelForSequenceClassification.from_pretrained(
-            CFG["MODEL_NAME"],
+            CFG.model.name,
             num_labels=1,
         )
+        self.criteria = lambda y_hat, y: torch.sqrt(F.mse_loss(y_hat, y))
+        self.history = {
+            "train_loss": [],
+            "valid_loss": [],
+        }
+        self.lr_history = []
 
     def forward(self, x):
         output = self.model(**x)
         return output.logits.flatten()
 
     def configure_optimizers(self):
-        optimizer = get_optimizer(self, self.CFG)
-        scheduler = get_scheduler(optimizer, self.CFG)
-        return [optimizer], [scheduler]
+        optimizer = get_optimizer(self)
+        scheduler = get_scheduler(optimizer)
+
+        return {
+            "optimizer": optimizer,
+            "lr_scheduler": {
+                "scheduler": scheduler,
+                "interval": CFG.scheduler.interval,
+            }
+        }
 
     def training_step(self, batch, batch_idx):
         x, y = batch
         y_hat = self(x)
-        loss = torch.sqrt(F.mse_loss(y_hat, y))
-        self.log(
-            'train_loss',
-            loss,
-            on_step=True,
-            on_epoch=True,
-            prog_bar=True,
-            logger=True
+        loss = self.criteria(y_hat, y)
+
+        self.lr_history.append(
+            self.lr_schedulers().get_lr()[0]
         )
-        return loss
+        return {"loss": loss}
 
     def validation_step(self, batch, batch_idx):
         x, y = batch
         y_hat = self(x)
-        loss = torch.sqrt(F.mse_loss(y_hat, y))
+        loss = self.criteria(y_hat, y)
+        return {"loss": loss}
+
+    def training_epoch_end(self, outputs):
+        train_loss_epoch = torch.stack(
+            [output["loss"] for output in outputs]
+        ).mean()
         self.log(
-            'valid_loss',
-            loss,
-            on_step=True,
-            on_epoch=True,
+            name="train_loss_epoch",
+            value=train_loss_epoch,
             prog_bar=True,
-            logger=True
+            logger=True,
+            on_step=False,
+            on_epoch=True,
         )
-        return loss
+        self.history["train_loss"].append(
+            train_loss_epoch.detach().cpu().numpy()
+        )
+
+    def validation_epoch_end(self, outputs):
+        valid_loss_epoch = torch.stack(
+            [output["loss"] for output in outputs]
+        ).mean()
+        self.log(
+            name=f"valid_loss_epoch",
+            value=valid_loss_epoch,
+            prog_bar=True,
+            logger=True,
+            on_step=False,
+            on_epoch=True,
+        )
+        self.history["valid_loss"].append(
+            valid_loss_epoch.detach().cpu().numpy()
+        )
 
 # ====================================================
-# DATA MODULE
+# dataloader
 # ====================================================
 
 
-class DataModule(pl.LightningDataModule):
-    def __init__(
-        self,
-        train_texts,
-        valid_texts,
-        test_texts,
-        train_labels,
-        valid_labels,
-        test_labels,
-        train_transform,
-        valid_transform,
-        test_transform,
-        batch_size,
-    ):
-        super(DataModule, self).__init__()
-        self.train_texts = train_texts
-        self.valid_texts = valid_texts
-        self.test_texts = test_texts
-        self.train_labels = train_labels
-        self.valid_labels = valid_labels
-        self.test_labels = test_labels
+def get_dataloader(
+    texts,
+    labels,
+    transform,
+):
+    ds = Dataset(texts, labels, transform)
+    dl = DataLoader(ds, **CFG.loader.train)
 
-        self.train_transform = train_transform
-        self.valid_transform = valid_transform
-        self.test_transform = test_transform
+    return dl
 
-        self.batch_size = batch_size
 
-    def prepare_data(self):
-        pass
+def get_test_dataloader(
+    texts,
+    transform,
+):
+    ds = TestDataset(texts, transform)
+    dl = DataLoader(ds, **CFG.loader.test)
 
-    def setup(self, stage=None):
-        if stage == 'fit' or stage is None:
-            self.train_dataset = Dataset(
-                self.train_texts,
-                self.train_labels,
-                self.train_transform
-            )
-            self.valid_dataset = Dataset(
-                self.valid_texts,
-                self.valid_labels,
-                self.valid_transform,
-            )
+    return dl
 
-        if stage == 'test' or stage is None:
-            self.test_dataset = TestDataset(
-                self.test_texts,
-                self.test_transform
-            )
+# ====================================================
+# plots
+# ====================================================
 
-    def setup_oof(self):
-        self.oof_dataset = TestDataset(
-            self.valid_texts,
-            self.valid_transform
-        )
 
-    def train_dataloader(self):
-        return DataLoader(
-            self.train_dataset,
-            shuffle=True,
-            batch_size=self.batch_size,
-            num_workers=1,
-            pin_memory=False,
-            drop_last=True
-        )
+def plot_dist(ytrue, ypred, filename):
+    plt.figure()
+    plt.hist(ytrue, alpha=0.5, bins=100)
+    plt.hist(ypred, alpha=0.5, bins=100)
+    plt.legend(["ytrue", "ypred"])
+    plt.savefig(filename)
+    plt.close()
 
-    def val_dataloader(self):
-        return DataLoader(
-            self.valid_dataset,
-            shuffle=False,
-            batch_size=self.batch_size,
-            num_workers=1,
-            pin_memory=False,
-            drop_last=False
-        )
 
-    def oof_dataloader(self):
-        return DataLoader(
-            self.oof_dataset,
-            shuffle=False,
-            batch_size=self.batch_size,
-            num_workers=1,
-            pin_memory=False,
-            drop_last=False
-        )
+def plot_training_curve(history, filename):
+    plt.figure()
+    legends = []
+    for k, ls in history.items():
+        plt.plot(range(len(ls)), ls, alpha=0.5)
+        legends.append(k)
+    plt.legend(legends)
+    plt.savefig(filename)
+    plt.close()
 
-    def test_dataloader(self):
-        return DataLoader(
-            self.test_dataset,
-            shuffle=False,
-            batch_size=self.batch_size,
-            num_workers=1,
-            pin_memory=False,
-            drop_last=False
-        )
+
+def plot_lr_history(lr_history, filename):
+    plt.figure()
+    plt.plot(range(len(lr_history)), lr_history)
+    plt.xlabel("step")
+    plt.ylabel("lr")
+    plt.legend(["lr"])
+    plt.savefig(filename)
+    plt.close()
+
 
 # %%
 
@@ -363,83 +312,141 @@ def detect_device():
     return {"precision": 32}
 
 
-CONFIG_PATH = "../config/config.yaml"
+def inference(trainer, model, df, dataloader):
+    prediction = torch.cat(
+        trainer.predict(
+            model=model,
+            dataloaders=dataloader,
+        )
+    ).detach().cpu().numpy()
+    df["target"] = prediction
+    return df[["id", "target"]]
 
 
-@hydra.main(config_path=CONFIG_PATH)
 def main(CFG):
+    os.chdir(CFG.dir.work_dir)
+
+    # seed
+    pl.seed_everything(CFG.general.seed)
+
     # device
     device_params = detect_device()
 
     # prepare df
     train_df = pd.read_csv(
         os.path.join(
-            hydra.utils.get_original_cwd(),
-            CFG["IO"]["INPUT_DIR"],
+            CFG.dir.input_dir,
             "train.csv"
         )
-    )
-    if CFG["BASE"]["DEBUG"]:
+    ).sort_values("id")
+    if CFG.general.debug:
         train_df = train_df.sample(200)
-        CFG["TRAIN"]["epochs"] = 1
+        CFG.training.epochs = 5
+        CFG.training.n_fold = 3
+        CFG.log.mlflow.experiment_name = "debug"
+
+    # logger
+    LOGGER = pl.loggers.MLFlowLogger(
+        experiment_name=CFG.log.mlflow.experiment_name,
+        save_dir="../mlruns"
+    )
 
     train_texts = train_df["excerpt"].values
     train_labels = train_df["target"].values
 
     # train
-    oof = np.zeros(train_labels.shape)
-    kf = KFold(
-        CFG["TRAIN"]["n_fold"],
+    oof_df_ls = []
+
+    kf = StratifiedKFold(
+        CFG.training.n_fold,
         shuffle=True,
-        random_state=CFG["TRAIN"]["shuffle_seed"],
+        random_state=CFG.training.shuffle_seed,
     )
-    for fold, (train_idx, valid_idx) in enumerate(kf.split(train_df)):
+    for fold, (train_idx, valid_idx) in enumerate(kf.split(train_df, pd.qcut(train_df["target"], CFG.training.n_fold).cat.codes)):
         print("#" * 30, f"fold: {fold}", "#" * 30)
-        model = Model(CFG)
-        dm = DataModule(
-            train_texts=train_texts[train_idx],
-            valid_texts=train_texts[valid_idx],
-            test_texts=None,
-            train_labels=train_labels[train_idx],
-            valid_labels=train_labels[valid_idx],
-            test_labels=None,
-            train_transform=Transform("train", CFG),
-            valid_transform=Transform("valid", CFG),
-            test_transform=Transform("test", CFG),
-            batch_size=CFG["TRAIN"]["batch_size"]
+        model = Model()
+
+        train_dataloader = get_dataloader(
+            texts=train_texts[train_idx],
+            labels=train_labels[train_idx],
+            transform=get_transform(data="train"),
         )
+        valid_dataloader = get_dataloader(
+            texts=train_texts[valid_idx],
+            labels=train_labels[valid_idx],
+            transform=get_transform(data="train"),
+        )
+
+        CHECKPOINT_NAME = \
+            f"fold{fold}_{CFG.model.name}_""{valid_loss_epoch:.2f}"
+        checkpoint_callback = pl.callbacks.ModelCheckpoint(
+            filename=CHECKPOINT_NAME,
+            monitor='valid_loss_epoch',
+            mode='min',
+            save_top_k=1,
+        )
+
+        CFG.training.steps_per_epoch = len(train_dataloader)
 
         trainer = pl.Trainer(
+            max_epochs=CFG.training.epochs,
+            logger=LOGGER,
+            callbacks=[checkpoint_callback],
+            num_sanity_val_steps=0,
             **device_params,
-            max_epochs=CFG["TRAIN"]["epochs"]
         )
 
-        trainer.fit(model, datamodule=dm)
+        trainer.fit(
+            model,
+            train_dataloader=train_dataloader,
+            val_dataloaders=valid_dataloader,
+        )
 
+        model.load_from_checkpoint(
+            checkpoint_callback.best_model_path
+        )
         model.freeze()
 
-        dm.setup_oof()
-        prediction = torch.cat(
-            trainer.predict(model, dm.oof_dataloader())
-        ).detach().cpu().numpy()
-        oof[valid_idx] = prediction
+        oof_dataloader = get_test_dataloader(
+            texts=train_texts[valid_idx],
+            transform=get_transform(data="test"),
+        )
 
-    validation_score = np.sqrt(mean_squared_error(train_df["target"], oof))
-    plt.figure()
-    plt.hist(train_df["target"], alpha=0.5, bins=100)
-    plt.hist(oof, alpha=0.5, bins=100)
-    plt.legend(["ground-truth", "oof"])
-    plt.savefig("oof_plot.png")
-    plt.close()
+        oof_prediction = inference(
+            trainer,
+            model,
+            train_df.iloc[valid_idx],
+            oof_dataloader
+        )
+
+        oof_df_ls.append(oof_prediction)
+
+        plot_training_curve(
+            model.history, filename=f"training_curve_fold{fold}.png"
+        )
+        plot_lr_history(
+            model.lr_history, filename=f"lr_scheduler_fold{fold}.png"
+        )
+
+    oof_df = pd.concat(oof_df_ls, axis=0).sort_values("id")
+    oof_df.to_csv("oof.csv", index=False)
+
+    validation_score = np.sqrt(mean_squared_error(
+        train_df["target"], oof_df["target"])
+    )
     print(f"validation score: {validation_score}")
-    f = open(f"val_score: {validation_score}")
-    f.close()
 
-    # copy this script to current directory
-    shutil.copyfile(__file__, os.path.join(".", os.path.basename(__file__)))
+    plot_dist(train_df["target"], oof_df["target"], filename="oof_dist.png")
+
+    LOGGER.log_hyperparams(CFG)
+    LOGGER.log_metrics({"validation_score": validation_score})
+    LOGGER.experiment.log_artifact(LOGGER._run_id, __file__)
+    LOGGER.experiment.log_artifact(LOGGER._run_id, "oof.csv")
+    LOGGER.experiment.log_artifact(LOGGER._run_id, "oof_dist.png")
 
 
 if __name__ == "__main__":
-    main()
+    CFG = OmegaConf.load("../config/config.yaml")
+    main(CFG)
 
 # %%
