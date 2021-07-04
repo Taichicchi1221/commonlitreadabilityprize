@@ -8,17 +8,19 @@ general:
   debug: False
 
 dir:
-  work_dir: ../work
+  work_dir: /workspaces/commonlitreadabilityprize/work
   input_dir: ../input/commonlitreadabilityprize
 
 training:
   n_fold: 5
   shuffle_seed: 0
-  epochs: 30
+  precision: 16
+  stochastic_weight_avg: True
+  epochs: 15
   steps_per_epoch: -1 # must be set in script
 
 model:
-  name: bert-base-uncased
+  name: roberta-base
 
 loader:
   train:
@@ -33,12 +35,12 @@ loader:
     pin_memory: False
 
 tokenizer:
-  max_length: 314
+  max_length: 512
 
 optimizer:
   name: Adam # [SGD, Adam, AdamW]
   params:
-    lr: 1.0e-18
+    lr: 1.0e-8
     # weight_decay: 1.0e-02 # AdamW
 
 scheduler:
@@ -54,7 +56,7 @@ scheduler:
     # T_0: 5 # CosineAnnealingWarmRestarts
     # eta_min: 1.0e-8 # CosineAnnealingWarmRestarts
     max_lr: 2.0e-5 # OneCycleLR
-    pct_start: 0.2 # OneCycleLR
-    steps_per_epoch: ${training.steps_per_epoch}
+    pct_start: 0.1 # OneCycleLR
+    steps_per_epoch: ${training.steps_per_epoch} # OneCycleLR
     epochs: ${training.epochs} # OneCycleLR
     verbose: False

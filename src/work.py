@@ -33,6 +33,20 @@ from tqdm import tqdm
 
 warnings.simplefilter("ignore")
 
+# %%
+
+# ====================================================
+# preprocess
+# ====================================================
+
+
+def preprocess_df(df):
+    df["target"] = df["target"].astype(np.float32)
+    df = df.loc[
+        ~((df["target"] == 0) & (df["standard_error"] == 0))
+    ].reset_index(drop=True).sort_values("id")
+    return df
+
 # ====================================================
 # transform
 # ====================================================
@@ -53,22 +67,18 @@ class Transform():
         )
         return tokenizer
 
-    def tokenize(self, text):
-        return self.tokenizer.encode_plus(
-            text,
-            add_special_tokens=True,
-            max_length=CFG.tokenizer.max_length,
-            truncation=True,
-            pad_to_max_length=True,
-            return_attention_mask=True,
-        )
+    def get_transform_fn(self):
+        def transform(text):
+            tokens = self.tokenizer(
+                text,
+                truncation=True,
+                max_length=CFG.tokenizer.max_length
+            )
+            return tokens
+        return transform
 
-    def __call__(self, text):
-        return self.tokenize(text)
-
-
-def get_transform(data):
-    return Transform(data=data)
+    def get_collate_fn(self):
+        return transformers.DataCollatorWithPadding(self.tokenizer)
 
 
 # ====================================================
@@ -118,10 +128,8 @@ class DatasetBase(torch.utils.data.Dataset):
     ):
         text = self.texts[idx]
         if self.transform:
-            text = self.transform(text)
-            text = {k: torch.tensor(v, dtype=torch.long)
-                    for k, v in text.items()}
-        return text
+            return self.transform(text)
+        return {"text": text}
 
 
 class Dataset(DatasetBase):
@@ -139,8 +147,9 @@ class Dataset(DatasetBase):
         idx,
     ):
         text = super().__getitem__(idx)
-        label = torch.tensor(self.labels[idx]).float()
-        return text, label
+        label = self.labels[idx]
+        text.update({"label": label})
+        return text
 
 
 class TestDataset(DatasetBase):
@@ -158,10 +167,11 @@ class TestDataset(DatasetBase):
         text = super().__getitem__(idx)
         return text
 
-
 # ====================================================
 # model
 # ====================================================
+
+
 class Model(pl.LightningModule):
     def __init__(
         self,
@@ -194,18 +204,28 @@ class Model(pl.LightningModule):
             }
         }
 
+    @staticmethod
+    def split_batch(batch):
+        x = {}
+        y = {}
+        for k in batch.keys():
+            if k == "labels":
+                y = batch[k]
+            else:
+                x.update({k: batch[k]})
+        return x, y
+
     def training_step(self, batch, batch_idx):
-        x, y = batch
+        x, y = self.split_batch(batch)
         y_hat = self(x)
         loss = self.criteria(y_hat, y)
-
         self.lr_history.append(
-            self.lr_schedulers().get_lr()[0]
+            self.optimizers(False).param_groups[0]["lr"]
         )
         return {"loss": loss}
 
     def validation_step(self, batch, batch_idx):
-        x, y = batch
+        x, y = self.split_batch(batch)
         y_hat = self(x)
         loss = self.criteria(y_hat, y)
         return {"loss": loss}
@@ -251,9 +271,10 @@ def get_dataloader(
     texts,
     labels,
     transform,
+    collate_fn,
 ):
     ds = Dataset(texts, labels, transform)
-    dl = DataLoader(ds, **CFG.loader.train)
+    dl = DataLoader(ds, collate_fn=collate_fn, **CFG.loader.train)
 
     return dl
 
@@ -261,9 +282,10 @@ def get_dataloader(
 def get_test_dataloader(
     texts,
     transform,
+    collate_fn,
 ):
     ds = TestDataset(texts, transform)
-    dl = DataLoader(ds, **CFG.loader.test)
+    dl = DataLoader(ds, collate_fn=collate_fn, **CFG.loader.test)
 
     return dl
 
@@ -292,7 +314,7 @@ def plot_training_curve(history, filename):
     plt.close()
 
 
-def plot_lr_history(lr_history, filename):
+def plot_lr_scheduler(lr_history, filename):
     plt.figure()
     plt.plot(range(len(lr_history)), lr_history)
     plt.xlabel("step")
@@ -308,8 +330,8 @@ def plot_lr_history(lr_history, filename):
 def detect_device():
     import torch
     if torch.cuda.is_available():
-        return {"gpus": 1, "precision": 16}
-    return {"precision": 32}
+        return {"gpus": 1}
+    return {"gpus": None}
 
 
 def inference(trainer, model, df, dataloader):
@@ -338,7 +360,9 @@ def main(CFG):
             CFG.dir.input_dir,
             "train.csv"
         )
-    ).sort_values("id")
+    )
+    train_df = preprocess_df(train_df)
+
     if CFG.general.debug:
         train_df = train_df.sample(200)
         CFG.training.epochs = 5
@@ -365,16 +389,20 @@ def main(CFG):
     for fold, (train_idx, valid_idx) in enumerate(kf.split(train_df, pd.qcut(train_df["target"], CFG.training.n_fold).cat.codes)):
         print("#" * 30, f"fold: {fold}", "#" * 30)
         model = Model()
+        transform_train = Transform(data="train")
+        transform_test = Transform(data="test")
 
         train_dataloader = get_dataloader(
             texts=train_texts[train_idx],
             labels=train_labels[train_idx],
-            transform=get_transform(data="train"),
+            transform=transform_train.get_transform_fn(),
+            collate_fn=transform_train.get_collate_fn(),
         )
         valid_dataloader = get_dataloader(
             texts=train_texts[valid_idx],
             labels=train_labels[valid_idx],
-            transform=get_transform(data="train"),
+            transform=transform_train.get_transform_fn(),
+            collate_fn=transform_train.get_collate_fn(),
         )
 
         CHECKPOINT_NAME = \
@@ -393,6 +421,8 @@ def main(CFG):
             logger=LOGGER,
             callbacks=[checkpoint_callback],
             num_sanity_val_steps=0,
+            precision=CFG.training.precision,
+            stochastic_weight_avg=CFG.training.stochastic_weight_avg,
             **device_params,
         )
 
@@ -409,7 +439,8 @@ def main(CFG):
 
         oof_dataloader = get_test_dataloader(
             texts=train_texts[valid_idx],
-            transform=get_transform(data="test"),
+            transform=transform_test.get_transform_fn(),
+            collate_fn=transform_test.get_collate_fn(),
         )
 
         oof_prediction = inference(
@@ -424,8 +455,10 @@ def main(CFG):
         plot_training_curve(
             model.history, filename=f"training_curve_fold{fold}.png"
         )
-        plot_lr_history(
-            model.lr_history, filename=f"lr_scheduler_fold{fold}.png"
+
+        plot_lr_scheduler(
+            model.lr_history,
+            filename=f"lr_scheduler_fold{fold}.png"
         )
 
     oof_df = pd.concat(oof_df_ls, axis=0).sort_values("id")
@@ -436,17 +469,30 @@ def main(CFG):
     )
     print(f"validation score: {validation_score}")
 
-    plot_dist(train_df["target"], oof_df["target"], filename="oof_dist.png")
+    plot_dist(
+        train_df["target"],
+        oof_df["target"],
+        filename="oof_dist.png"
+    )
 
     LOGGER.log_hyperparams(CFG)
     LOGGER.log_metrics({"validation_score": validation_score})
     LOGGER.experiment.log_artifact(LOGGER._run_id, __file__)
     LOGGER.experiment.log_artifact(LOGGER._run_id, "oof.csv")
     LOGGER.experiment.log_artifact(LOGGER._run_id, "oof_dist.png")
+    for fold in range(CFG.training.n_fold):
+        LOGGER.experiment.log_artifact(
+            LOGGER._run_id, f"training_curve_fold{fold}.png"
+        )
+        LOGGER.experiment.log_artifact(
+            LOGGER._run_id, f"lr_scheduler_fold{fold}.png"
+        )
 
 
 if __name__ == "__main__":
-    CFG = OmegaConf.load("../config/config.yaml")
+    CFG = OmegaConf.load(
+        "/workspaces/commonlitreadabilityprize/config/config.yaml"
+    )
     main(CFG)
 
 # %%
