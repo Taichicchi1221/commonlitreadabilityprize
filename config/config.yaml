@@ -1,44 +1,59 @@
-hydra:
-  run:
-    dir: ../logs/outputs/${now:%Y-%m-%d}/${now:%H-%M-%S}
+log:
+  mlflow:
+    experiment_name: baseline
 
-BASE:
-  SEED: 0
-  DEBUG: False
+general:
+  seed: 0
+  debug: False
 
-IO:
-  INPUT_DIR: ../input/commonlitreadabilityprize
+dir:
+  work_dir: ../work
+  input_dir: ../input/commonlitreadabilityprize
 
-TRAIN:
+training:
   n_fold: 5
   shuffle_seed: 0
-  batch_size: 16
-  epochs: 50
+  epochs: 30
+  steps_per_epoch: -1 # must be set in script
 
-MODEL_NAME: distilbert-base-uncased
+model:
+  name: distilbert-base-uncased
 
-TRANSFORM:
+loader:
+  train:
+    batch_size: 8
+    shuffle: True
+    drop_last: True
+    pin_memory: False
+  test:
+    batch_size: 32
+    shuffle: False
+    drop_last: False
+    pin_memory: False
+
+tokenizer:
   max_length: 314
 
-OPTIMIZER:
-  name: "Adam" # [Adam, AdamW]
-  params_Adam:
-    lr: 1.0e-04
-    weight_decay: 1.0e-04
-  params_AdamW:
-    lr: 1.0e-04
-    weight_decay: 1.0e-04
+optimizer:
+  name: Adam # [SGD, Adam, AdamW]
+  params:
+    lr: 1.0e-18
+    # weight_decay: 1.0e-02 # AdamW
 
-SCHEDULER:
-  name: CosineAnnealingWarmRestarts # [ReduceLROnPlateau, CosineAnnealingLR, CosineAnnealingWarmRestarts]
-  params_ReduceLROnPlateau:
-    mode: min
-    factor: 0.2
-    patience: 4
-    eps: 1.0e-06
-  params_CosineAnnealingLR:
-    T_max: 50
-    eta_min: 1.0e-08
-  params_CosineAnnealingWarmRestarts:
-    T_0: 5
-    eta_min: 1.0e-08
+scheduler:
+  name: OneCycleLR # [ReduceLROnPlateau, CosineAnealingLR, CosineAnnealingWarmRestarts, OneCycleLR]
+  interval: step # [epoch, step]
+  params:
+    # mode: min # ReduceLROnPlateau
+    # factor: 0.2 # ReduceLROnPlateau
+    # patience: 4 # ReduceLROnPlateau
+    # eps: 1.0e-06 # ReduceLROnPlateau
+    # T_max: ${TRAIN.epochs} # CosineAnealingLR
+    # eta_min: 1.0e-8 # CosineAnealingLR
+    # T_0: 5 # CosineAnnealingWarmRestarts
+    # eta_min: 1.0e-8 # CosineAnnealingWarmRestarts
+    max_lr: 2.0e-5 # OneCycleLR
+    pct_start: 0.2 # OneCycleLR
+    steps_per_epoch: ${training.steps_per_epoch}
+    epochs: ${training.epochs} # OneCycleLR
+    verbose: False
