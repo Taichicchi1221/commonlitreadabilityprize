@@ -1,5 +1,6 @@
 log:
   mlflow:
+    save_dir: ../mlruns
     experiment_name: baseline
 
 general:
@@ -17,7 +18,7 @@ training:
   steps_per_epoch: -1 # must be set in script
 
 model:
-  name: distilbert-base-uncased
+  name: bert-base-uncased
 
 loader:
   train:

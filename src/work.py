@@ -218,7 +218,7 @@ class Model(pl.LightningModule):
             name="train_loss_epoch",
             value=train_loss_epoch,
             prog_bar=True,
-            logger=True,
+            logger=False,
             on_step=False,
             on_epoch=True,
         )
@@ -231,10 +231,10 @@ class Model(pl.LightningModule):
             [output["loss"] for output in outputs]
         ).mean()
         self.log(
-            name=f"valid_loss_epoch",
+            name="valid_loss_epoch",
             value=valid_loss_epoch,
             prog_bar=True,
-            logger=True,
+            logger=False,
             on_step=False,
             on_epoch=True,
         )
@@ -348,7 +348,7 @@ def main(CFG):
     # logger
     LOGGER = pl.loggers.MLFlowLogger(
         experiment_name=CFG.log.mlflow.experiment_name,
-        save_dir="../mlruns"
+        save_dir=CFG.log.mlflow.save_dir,
     )
 
     train_texts = train_df["excerpt"].values
