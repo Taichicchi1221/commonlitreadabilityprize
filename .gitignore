@@ -1,2 +1,2 @@
-./mlruns/*
-./work/*
+/mlruns
+/work
