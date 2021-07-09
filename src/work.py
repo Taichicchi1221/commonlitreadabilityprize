@@ -68,13 +68,21 @@ class Transform():
         return tokenizer
 
     def get_transform_fn(self):
+        def clean_text(text):
+            text = re.sub("\n", "", text)
+            text = re.sub("\r", "", text)
+            text = re.sub("[ ]+", " ", text)
+            return text
+
         def transform(text):
+            text = clean_text(text)
             tokens = self.tokenizer(
                 text,
                 truncation=True,
                 max_length=CFG.tokenizer.max_length
             )
             return tokens
+
         return transform
 
     def get_collate_fn(self):
@@ -177,11 +185,20 @@ class Model(pl.LightningModule):
         self,
     ):
         super().__init__()
+        config = transformers.AutoConfig.from_pretrained(
+            CFG.model.name
+        )
+        config.update(CFG.model.params)
+        config.update({"num_labels": 1})
         self.model = transformers.AutoModelForSequenceClassification.from_pretrained(
             CFG.model.name,
-            num_labels=1,
+            config=config,
         )
+
+        # critetria
         self.criteria = lambda y_hat, y: torch.sqrt(F.mse_loss(y_hat, y))
+
+        # init model training histories
         self.history = {
             "train_loss": [],
             "valid_loss": [],
@@ -236,7 +253,7 @@ class Model(pl.LightningModule):
         ).mean()
         self.log(
             name="train_loss_epoch",
-            value=train_loss_epoch,
+            value=train_loss_epoch.item(),
             prog_bar=True,
             logger=False,
             on_step=False,
@@ -252,7 +269,7 @@ class Model(pl.LightningModule):
         ).mean()
         self.log(
             name="valid_loss_epoch",
-            value=valid_loss_epoch,
+            value=valid_loss_epoch.item(),
             prog_bar=True,
             logger=False,
             on_step=False,
@@ -317,9 +334,19 @@ def plot_training_curve(history, filename):
 def plot_lr_scheduler(lr_history, filename):
     plt.figure()
     plt.plot(range(len(lr_history)), lr_history)
+    plt.vlines(
+        x=[
+            step for step in range(len(lr_history))
+            if step % CFG.training.steps_per_epoch == 0
+        ],
+        ymin=min(lr_history),
+        ymax=max(lr_history),
+        color="gray",
+        linestyles="dashed"
+    )
     plt.xlabel("step")
     plt.ylabel("lr")
-    plt.legend(["lr"])
+    plt.legend(["lr", "epoch"])
     plt.savefig(filename)
     plt.close()
 
@@ -334,15 +361,23 @@ def detect_device():
     return {"gpus": None}
 
 
-def inference(trainer, model, df, dataloader):
+def inference(trainer, model, test_ids, test_texts):
+    transform = Transform(data="test")
+    dataloader = get_test_dataloader(
+        texts=test_texts,
+        transform=transform.get_transform_fn(),
+        collate_fn=transform.get_collate_fn(),
+    )
     prediction = torch.cat(
         trainer.predict(
             model=model,
             dataloaders=dataloader,
         )
     ).detach().cpu().numpy()
+    df = pd.DataFrame()
+    df["id"] = test_ids
     df["target"] = prediction
-    return df[["id", "target"]]
+    return df
 
 
 def main(CFG):
@@ -388,9 +423,10 @@ def main(CFG):
     )
     for fold, (train_idx, valid_idx) in enumerate(kf.split(train_df, pd.qcut(train_df["target"], CFG.training.n_fold).cat.codes)):
         print("#" * 30, f"fold: {fold}", "#" * 30)
+
         model = Model()
+
         transform_train = Transform(data="train")
-        transform_test = Transform(data="test")
 
         train_dataloader = get_dataloader(
             texts=train_texts[train_idx],
@@ -432,26 +468,6 @@ def main(CFG):
             val_dataloaders=valid_dataloader,
         )
 
-        model.load_from_checkpoint(
-            checkpoint_callback.best_model_path
-        )
-        model.freeze()
-
-        oof_dataloader = get_test_dataloader(
-            texts=train_texts[valid_idx],
-            transform=transform_test.get_transform_fn(),
-            collate_fn=transform_test.get_collate_fn(),
-        )
-
-        oof_prediction = inference(
-            trainer,
-            model,
-            train_df.iloc[valid_idx],
-            oof_dataloader
-        )
-
-        oof_df_ls.append(oof_prediction)
-
         plot_training_curve(
             model.history, filename=f"training_curve_fold{fold}.png"
         )
@@ -460,6 +476,32 @@ def main(CFG):
             model.lr_history,
             filename=f"lr_scheduler_fold{fold}.png"
         )
+
+        del model, train_dataloader, valid_dataloader
+        gc.collect()
+        torch.cuda.empty_cache()
+        pl.utilities.memory.garbage_collection_cuda()
+
+        model = Model.load_from_checkpoint(
+            checkpoint_callback.best_model_path
+        )
+        model.eval()
+
+        oof_ids = train_df["id"].values[valid_idx]
+        oof_texts = train_df["excerpt"].values[valid_idx]
+        oof_prediction = inference(
+            trainer,
+            model,
+            oof_ids,
+            oof_texts,
+        )
+
+        oof_df_ls.append(oof_prediction)
+
+        del model
+        gc.collect()
+        torch.cuda.empty_cache()
+        pl.utilities.memory.garbage_collection_cuda()
 
     oof_df = pd.concat(oof_df_ls, axis=0).sort_values("id")
     oof_df.to_csv("oof.csv", index=False)
@@ -477,7 +519,8 @@ def main(CFG):
 
     LOGGER.log_hyperparams(CFG)
     LOGGER.log_metrics({"validation_score": validation_score})
-    LOGGER.experiment.log_artifact(LOGGER._run_id, __file__)
+    if globals().get("__file__"):
+        LOGGER.experiment.log_artifact(LOGGER._run_id, __file__)
     LOGGER.experiment.log_artifact(LOGGER._run_id, "oof.csv")
     LOGGER.experiment.log_artifact(LOGGER._run_id, "oof_dist.png")
     for fold in range(CFG.training.n_fold):

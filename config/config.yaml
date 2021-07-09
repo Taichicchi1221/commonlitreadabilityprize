@@ -1,3 +1,6 @@
+# ====================================================
+# config
+# ====================================================
 log:
   mlflow:
     save_dir: ../mlruns
@@ -15,12 +18,14 @@ training:
   n_fold: 5
   shuffle_seed: 0
   precision: 16
-  stochastic_weight_avg: True
-  epochs: 15
+  stochastic_weight_avg: False
+  epochs: 30
   steps_per_epoch: -1 # must be set in script
 
 model:
   name: roberta-base
+  params:
+    hidden_dropout_prob: 0.0
 
 loader:
   train:
@@ -40,7 +45,7 @@ tokenizer:
 optimizer:
   name: Adam # [SGD, Adam, AdamW]
   params:
-    lr: 1.0e-8
+    lr: 1.0e-08
     # weight_decay: 1.0e-02 # AdamW
 
 scheduler:
@@ -52,10 +57,11 @@ scheduler:
     # patience: 4 # ReduceLROnPlateau
     # eps: 1.0e-06 # ReduceLROnPlateau
     # T_max: ${TRAIN.epochs} # CosineAnealingLR
-    # eta_min: 1.0e-8 # CosineAnealingLR
-    # T_0: 5 # CosineAnnealingWarmRestarts
-    # eta_min: 1.0e-8 # CosineAnnealingWarmRestarts
-    max_lr: 2.0e-5 # OneCycleLR
+    # eta_min: 1.0e-8 # 
+    # T_0: ${training.steps_per_epoch} # CosineAnnealingWarmRestarts
+    # T_mult: 2 # CosineAnnealingWarmRestarts
+    # eta_min: 1.0e-8 # CosineAnealingLR, CosineAnnealingWarmRestarts
+    max_lr: 2.0e-05 # OneCycleLR
     pct_start: 0.1 # OneCycleLR
     steps_per_epoch: ${training.steps_per_epoch} # OneCycleLR
     epochs: ${training.epochs} # OneCycleLR
