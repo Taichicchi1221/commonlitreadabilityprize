@@ -29,6 +29,7 @@ from torch import nn
 from torch.nn import functional as F
 from torch.optim import optimizer
 from torch.utils.data import DataLoader
+import torchmetrics
 from tqdm import tqdm
 
 warnings.simplefilter("ignore")
@@ -48,38 +49,61 @@ def preprocess_df(df):
     return df
 
 # ====================================================
+# metric
+# ====================================================
+
+
+class RMSE(torchmetrics.Metric):
+    def __init__(self):
+        super().__init__(compute_on_step=False)
+        self.add_state(
+            "sum_squared_errors",
+            torch.tensor(0.0),
+            dist_reduce_fx="sum",
+        )
+        self.add_state(
+            "n_observations",
+            torch.tensor(0.0),
+            dist_reduce_fx="sum",
+        )
+
+    def update(self, preds, target):
+        self.sum_squared_errors += torch.sum((preds - target) ** 2)
+        self.n_observations += preds.numel()
+
+    def compute(self):
+        return torch.sqrt(self.sum_squared_errors / self.n_observations)
+
+
+# ====================================================
 # transform
 # ====================================================
 
 
 class Transform():
-    def __init__(self, data):
+    def __init__(self, data, tokenizer_name, tokenizer_max_length):
         self.data = data
+        self.tokenizer_name = tokenizer_name
+        self.tokenizer_max_length = tokenizer_max_length
+
         self.tokenizer = self.get_tokenizer()
 
     def get_tokenizer(self):
         config = transformers.AutoConfig.from_pretrained(
-            CFG.model.name
+            self.tokenizer_name
         )
         tokenizer = transformers.AutoTokenizer.from_pretrained(
-            CFG.model.name,
+            self.tokenizer_name,
             config=config,
         )
         return tokenizer
 
     def get_transform_fn(self):
-        def clean_text(text):
-            text = re.sub("\n", "", text)
-            text = re.sub("\r", "", text)
-            text = re.sub("[ ]+", " ", text)
-            return text
-
         def transform(text):
-            text = clean_text(text)
             tokens = self.tokenizer(
                 text,
                 truncation=True,
-                max_length=CFG.tokenizer.max_length
+                max_length=self.tokenizer_max_length
             )
             return tokens
 
@@ -94,22 +118,22 @@ class Transform():
 # ====================================================
 
 
-def get_optimizer(model):
+def get_optimizer(model, optimizer_name, optimizer_params):
     return getattr(
         torch.optim,
-        CFG.optimizer.name
-    )(model.parameters(), **CFG.optimizer.params)
+        optimizer_name
+    )(model.parameters(), **optimizer_params)
 
 # ====================================================
 # scheduler
 # ====================================================
 
 
-def get_scheduler(optimizer):
+def get_scheduler(optimizer, scheduler_name, scheduler_params):
     return getattr(
         torch.optim.lr_scheduler,
-        CFG.scheduler.name
-    )(optimizer, **CFG.scheduler.params)
+        scheduler_name
+    )(optimizer, **scheduler_params)
 
 
 # ====================================================
@@ -180,44 +204,115 @@ class TestDataset(DatasetBase):
 # ====================================================
 
 
+class BaseModel(nn.Module):
+    def __init__(
+        self,
+        basemodel_name: str,
+        multisample_dropout: int,
+        multisample_dropout_rate: float,
+        model_params,
+    ):
+        super().__init__()
+
+        # model
+        config = transformers.AutoConfig.from_pretrained(
+            basemodel_name
+        )
+        config.update(model_params)
+        self.model = transformers.AutoModel.from_pretrained(
+            basemodel_name,
+            config=config,
+        )
+        self.middle_layer_norm = nn.LayerNorm(config.hidden_size)
+        self.middle_linear = nn.Linear(
+            config.hidden_size, config.hidden_size // 2
+        )
+        self.layer_norm = nn.LayerNorm(config.hidden_size // 2)
+        self.dropouts = nn.ModuleList([
+            nn.Dropout(multisample_dropout_rate) for _ in range(multisample_dropout)
+        ])
+        self.regressors = nn.ModuleList([
+            nn.Linear(config.hidden_size // 2, 1) for _ in range(multisample_dropout)
+        ])
+
+    def forward(self, x):
+        output = self.model(**x)[1]
+        output = self.middle_layer_norm(output)
+        output = F.relu(self.middle_linear(output))
+        output = self.layer_norm(output)
+        logits = torch.stack(
+            [
+                regressor(dropout(output)) for regressor, dropout in zip(self.regressors, self.dropouts)
+            ]
+        ).mean(axis=0)
+        return logits.flatten()
+
+
 class Model(pl.LightningModule):
     def __init__(
         self,
+        basemodel_name: str,
+        multisample_dropout: int,
+        multisample_dropout_rate: float,
+        model_params: dict,
+        optimizer_name: str,
+        optimizer_params: dict,
+        scheduler_name: str,
+        scheduler_params: dict,
+        scheduler_interval: str,
     ):
         super().__init__()
-        config = transformers.AutoConfig.from_pretrained(
-            CFG.model.name
-        )
-        config.update(CFG.model.params)
-        config.update({"num_labels": 1})
-        self.model = transformers.AutoModelForSequenceClassification.from_pretrained(
-            CFG.model.name,
-            config=config,
+
+        # model
+        self.model = BaseModel(
+            basemodel_name=basemodel_name,
+            multisample_dropout=multisample_dropout,
+            multisample_dropout_rate=multisample_dropout_rate,
+            model_params=model_params,
         )
 
+        # optimizer and shceduler
+        self.optimizer_name = optimizer_name
+        self.optimizer_params = optimizer_params
+        self.scheduler_name = scheduler_name
+        self.scheduler_params = scheduler_params
+        self.scheduler_interval = scheduler_interval
+
         # critetria
-        self.criteria = lambda y_hat, y: torch.sqrt(F.mse_loss(y_hat, y))
+        self.criterion = torch.nn.MSELoss()
+
+        # metrics
+        self.train_rmse = RMSE()
+        self.valid_rmse = RMSE()
 
         # init model training histories
         self.history = {
-            "train_loss": [],
-            "valid_loss": [],
+            "train_rmse": [],
+            "valid_rmse": [],
+            "lr": []
         }
-        self.lr_history = []
 
     def forward(self, x):
-        output = self.model(**x)
-        return output.logits.flatten()
+        output = self.model(x)
+        return output
 
     def configure_optimizers(self):
-        optimizer = get_optimizer(self)
-        scheduler = get_scheduler(optimizer)
+        optimizer = get_optimizer(
+            self.model,
+            optimizer_name=self.optimizer_name,
+            optimizer_params=self.optimizer_params,
+        )
+        scheduler = get_scheduler(
+            optimizer,
+            scheduler_name=self.scheduler_name,
+            scheduler_params=self.scheduler_params,
+        )
 
         return {
             "optimizer": optimizer,
             "lr_scheduler": {
                 "scheduler": scheduler,
-                "interval": CFG.scheduler.interval,
+                "interval": self.scheduler_interval,
             }
         }
 
@@ -235,49 +330,47 @@ class Model(pl.LightningModule):
     def training_step(self, batch, batch_idx):
         x, y = self.split_batch(batch)
         y_hat = self(x)
-        loss = self.criteria(y_hat, y)
-        self.lr_history.append(
+        loss = self.criterion(y_hat, y)
+        self.train_rmse(y_hat, y)
+        self.log(
+            name="train_rmse",
+            value=self.train_rmse,
+            prog_bar=True,
+            logger=False,
+            on_step=False,
+            on_epoch=True,
+        )
+        self.history["lr"].append(
             self.optimizers(False).param_groups[0]["lr"]
         )
-        return {"loss": loss}
+        return loss
 
     def validation_step(self, batch, batch_idx):
         x, y = self.split_batch(batch)
         y_hat = self(x)
-        loss = self.criteria(y_hat, y)
-        return {"loss": loss}
-
-    def training_epoch_end(self, outputs):
-        train_loss_epoch = torch.stack(
-            [output["loss"] for output in outputs]
-        ).mean()
+        loss = self.criterion(y_hat, y)
+        self.valid_rmse(y_hat, y)
         self.log(
-            name="train_loss_epoch",
-            value=train_loss_epoch.item(),
+            name="valid_rmse",
+            value=self.valid_rmse,
             prog_bar=True,
             logger=False,
             on_step=False,
             on_epoch=True,
         )
-        self.history["train_loss"].append(
-            train_loss_epoch.detach().cpu().numpy()
-        )
+        return loss
 
-    def validation_epoch_end(self, outputs):
-        valid_loss_epoch = torch.stack(
-            [output["loss"] for output in outputs]
-        ).mean()
-        self.log(
-            name="valid_loss_epoch",
-            value=valid_loss_epoch.item(),
-            prog_bar=True,
-            logger=False,
-            on_step=False,
-            on_epoch=True,
+    def on_train_epoch_end(self) -> None:
+        self.history["train_rmse"].append(
+            self.train_rmse.compute().detach().cpu().numpy()
         )
-        self.history["valid_loss"].append(
-            valid_loss_epoch.detach().cpu().numpy()
+        return super().on_train_epoch_end()
+
+    def on_validation_epoch_end(self) -> None:
+        self.history["valid_rmse"].append(
+            self.valid_rmse.compute().detach().cpu().numpy()
         )
+        return super().on_validation_epoch_end()
 
 # ====================================================
 # dataloader
@@ -289,9 +382,10 @@ def get_dataloader(
     labels,
     transform,
     collate_fn,
+    loader_params,
 ):
     ds = Dataset(texts, labels, transform)
-    dl = DataLoader(ds, collate_fn=collate_fn, **CFG.loader.train)
+    dl = DataLoader(ds, collate_fn=collate_fn, **loader_params)
 
     return dl
 
@@ -300,9 +394,10 @@ def get_test_dataloader(
     texts,
     transform,
     collate_fn,
+    loader_params,
 ):
     ds = TestDataset(texts, transform)
-    dl = DataLoader(ds, collate_fn=collate_fn, **CFG.loader.test)
+    dl = DataLoader(ds, collate_fn=collate_fn, **loader_params)
 
     return dl
 
@@ -320,29 +415,32 @@ def plot_dist(ytrue, ypred, filename):
     plt.close()
 
 
-def plot_training_curve(history, filename):
+def plot_training_curve(train_history, valid_history, filename):
     plt.figure()
     legends = []
-    for k, ls in history.items():
-        plt.plot(range(len(ls)), ls, alpha=0.5)
-        legends.append(k)
+    plt.plot(range(len(train_history)), train_history,
+             marker=".", color="skyblue")
+    legends.append("train")
+    plt.plot(range(len(valid_history)), valid_history,
+             marker=".", color="orange")
+    legends.append("valid")
     plt.legend(legends)
     plt.savefig(filename)
     plt.close()
 
 
-def plot_lr_scheduler(lr_history, filename):
+def plot_lr_scheduler(lr_history, filename, steps_per_epoch):
+    epoch_index = [
+        step for step in range(len(lr_history)) if step % steps_per_epoch == 0
+    ]
     plt.figure()
     plt.plot(range(len(lr_history)), lr_history)
-    plt.vlines(
-        x=[
-            step for step in range(len(lr_history))
-            if step % CFG.training.steps_per_epoch == 0
-        ],
-        ymin=min(lr_history),
-        ymax=max(lr_history),
-        color="gray",
-        linestyles="dashed"
+    plt.plot(
+        [i for i in range(len(lr_history)) if i in epoch_index],
+        [lr_history[i] for i in range(len(lr_history)) if i in epoch_index],
+        color="orange",
+        linestyle="None",
+        marker="D"
     )
     plt.xlabel("step")
     plt.ylabel("lr")
@@ -351,8 +449,9 @@ def plot_lr_scheduler(lr_history, filename):
     plt.close()
 
 
-# %%
-
+# ====================================================
+# util
+# ====================================================
 
 def detect_device():
     import torch
@@ -360,13 +459,31 @@ def detect_device():
         return {"gpus": 1}
     return {"gpus": None}
 
+# ====================================================
+# inference
+# ====================================================
 
-def inference(trainer, model, test_ids, test_texts):
-    transform = Transform(data="test")
+
+def inference(
+    test_ids,
+    test_texts,
+    trainer,
+    model,
+    tokenizer_name,
+    tokenizer_max_length,
+    loader_params,
+):
+    print(f"inference check: model.model.training={model.model.training}")
+    transform = Transform(
+        data="test",
+        tokenizer_name=tokenizer_name,
+        tokenizer_max_length=tokenizer_max_length
+    )
     dataloader = get_test_dataloader(
         texts=test_texts,
         transform=transform.get_transform_fn(),
         collate_fn=transform.get_collate_fn(),
+        loader_params=loader_params,
     )
     prediction = torch.cat(
         trainer.predict(
@@ -405,7 +522,7 @@ def main(CFG):
         CFG.log.mlflow.experiment_name = "debug"
 
     # logger
-    LOGGER = pl.loggers.MLFlowLogger(
+    MLFLOW_LOGGER = pl.loggers.MLFlowLogger(
         experiment_name=CFG.log.mlflow.experiment_name,
         save_dir=CFG.log.mlflow.save_dir,
     )
@@ -416,45 +533,67 @@ def main(CFG):
     # train
     oof_df_ls = []
 
-    kf = StratifiedKFold(
+    kf = eval(CFG.training.splitter)(
         CFG.training.n_fold,
         shuffle=True,
         random_state=CFG.training.shuffle_seed,
     )
-    for fold, (train_idx, valid_idx) in enumerate(kf.split(train_df, pd.qcut(train_df["target"], CFG.training.n_fold).cat.codes)):
+    for fold, (train_idx, valid_idx) in enumerate(
+        kf.split(
+            train_df, pd.cut(train_df["target"], 5 *
+                             CFG.training.n_fold).cat.codes
+        )
+    ):
         print("#" * 30, f"fold: {fold}", "#" * 30)
 
-        model = Model()
+        model = Model(
+            basemodel_name=CFG.model.name,
+            multisample_dropout=CFG.model.multisample_dropout,
+            multisample_dropout_rate=CFG.model.multisample_dropout_rate,
+            model_params=CFG.model.params,
+            optimizer_name=CFG.optimizer.name,
+            optimizer_params=CFG.optimizer.params,
+            scheduler_name=CFG.scheduler.name,
+            scheduler_params=CFG.scheduler.params,
+            scheduler_interval=CFG.scheduler.interval,
+        )
 
-        transform_train = Transform(data="train")
+        transform_train = Transform(
+            data="train",
+            tokenizer_name=CFG.tokenizer.name,
+            tokenizer_max_length=CFG.tokenizer.max_length,
+        )
 
         train_dataloader = get_dataloader(
             texts=train_texts[train_idx],
             labels=train_labels[train_idx],
             transform=transform_train.get_transform_fn(),
             collate_fn=transform_train.get_collate_fn(),
+            loader_params=CFG.loader.train,
         )
         valid_dataloader = get_dataloader(
             texts=train_texts[valid_idx],
             labels=train_labels[valid_idx],
             transform=transform_train.get_transform_fn(),
             collate_fn=transform_train.get_collate_fn(),
+            loader_params=CFG.loader.train,
         )
 
         CHECKPOINT_NAME = \
-            f"fold{fold}_{CFG.model.name}_""{valid_loss_epoch:.2f}"
+            f"fold{fold}_{CFG.model.name}_""{epoch:02d}_{valid_rmse:.2f}"
         checkpoint_callback = pl.callbacks.ModelCheckpoint(
             filename=CHECKPOINT_NAME,
-            monitor='valid_loss_epoch',
+            monitor='valid_rmse',
             mode='min',
             save_top_k=1,
+            save_weights_only=True,
         )
 
         CFG.training.steps_per_epoch = len(train_dataloader)
 
         trainer = pl.Trainer(
             max_epochs=CFG.training.epochs,
-            logger=LOGGER,
+            logger=MLFLOW_LOGGER,
             callbacks=[checkpoint_callback],
             num_sanity_val_steps=0,
             precision=CFG.training.precision,
@@ -469,36 +608,57 @@ def main(CFG):
         )
 
         plot_training_curve(
-            model.history, filename=f"training_curve_fold{fold}.png"
+            model.history["train_rmse"],
+            model.history["valid_rmse"],
+            filename=f"training_curve_fold{fold}.png"
         )
 
         plot_lr_scheduler(
-            model.lr_history,
-            filename=f"lr_scheduler_fold{fold}.png"
+            model.history["lr"],
+            filename=f"lr_scheduler_fold{fold}.png",
+            steps_per_epoch=CFG.training.steps_per_epoch
         )
 
-        del model, train_dataloader, valid_dataloader
+        del trainer, model, train_dataloader, valid_dataloader
         gc.collect()
         torch.cuda.empty_cache()
         pl.utilities.memory.garbage_collection_cuda()
 
+        predict_trainer = pl.Trainer(
+            precision=CFG.training.precision,
+            logger=None,
+            **device_params,
+        )
         model = Model.load_from_checkpoint(
-            checkpoint_callback.best_model_path
+            checkpoint_path=checkpoint_callback.best_model_path,
+            basemodel_name=CFG.model.name,
+            multisample_dropout=CFG.model.multisample_dropout,
+            multisample_dropout_rate=CFG.model.multisample_dropout_rate,
+            model_params=CFG.model.params,
+            optimizer_name=None,
+            optimizer_params=None,
+            scheduler_name=None,
+            scheduler_params=None,
+            scheduler_interval=None,
         )
         model.eval()
+        model.freeze()
 
         oof_ids = train_df["id"].values[valid_idx]
         oof_texts = train_df["excerpt"].values[valid_idx]
         oof_prediction = inference(
-            trainer,
-            model,
             oof_ids,
             oof_texts,
+            trainer=predict_trainer,
+            model=model,
+            tokenizer_name=CFG.tokenizer.name,
+            tokenizer_max_length=CFG.tokenizer.max_length,
+            loader_params=CFG.loader.test,
         )
 
         oof_df_ls.append(oof_prediction)
 
-        del model
+        del predict_trainer, model
         gc.collect()
         torch.cuda.empty_cache()
         pl.utilities.memory.garbage_collection_cuda()
@@ -506,8 +666,8 @@ def main(CFG):
     oof_df = pd.concat(oof_df_ls, axis=0).sort_values("id")
     oof_df.to_csv("oof.csv", index=False)
 
-    validation_score = np.sqrt(mean_squared_error(
-        train_df["target"], oof_df["target"])
+    validation_score = mean_squared_error(
+        train_df["target"], oof_df["target"], squared=False
     )
     print(f"validation score: {validation_score}")
 
@@ -517,18 +677,22 @@ def main(CFG):
         filename="oof_dist.png"
     )
 
-    LOGGER.log_hyperparams(CFG)
-    LOGGER.log_metrics({"validation_score": validation_score})
+    MLFLOW_LOGGER.log_hyperparams(CFG)
+    open("config.yaml", "w").write(OmegaConf.to_yaml(CFG))
+
+    MLFLOW_LOGGER.log_metrics({"validation_score": validation_score})
     if globals().get("__file__"):
-        LOGGER.experiment.log_artifact(LOGGER._run_id, __file__)
-    LOGGER.experiment.log_artifact(LOGGER._run_id, "oof.csv")
-    LOGGER.experiment.log_artifact(LOGGER._run_id, "oof_dist.png")
+        MLFLOW_LOGGER.experiment.log_artifact(MLFLOW_LOGGER._run_id, __file__)
+    MLFLOW_LOGGER.experiment.log_artifact(MLFLOW_LOGGER._run_id, "config.yaml")
+    MLFLOW_LOGGER.experiment.log_artifact(MLFLOW_LOGGER._run_id, "oof.csv")
+    MLFLOW_LOGGER.experiment.log_artifact(
+        MLFLOW_LOGGER._run_id, "oof_dist.png")
     for fold in range(CFG.training.n_fold):
-        LOGGER.experiment.log_artifact(
-            LOGGER._run_id, f"training_curve_fold{fold}.png"
+        MLFLOW_LOGGER.experiment.log_artifact(
+            MLFLOW_LOGGER._run_id, f"training_curve_fold{fold}.png"
         )
-        LOGGER.experiment.log_artifact(
-            LOGGER._run_id, f"lr_scheduler_fold{fold}.png"
+        MLFLOW_LOGGER.experiment.log_artifact(
+            MLFLOW_LOGGER._run_id, f"lr_scheduler_fold{fold}.png"
         )
 
 
