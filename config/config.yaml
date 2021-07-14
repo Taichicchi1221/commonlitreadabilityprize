@@ -7,8 +7,8 @@ log:
     experiment_name: baseline
 
 general:
-  seed: 0
-  debug: True
+  seed: 6
+  debug: False
 
 dir:
   work_dir: /workspaces/commonlitreadabilityprize/work
@@ -17,10 +17,10 @@ dir:
 training:
   splitter: StratifiedKFold # [KFold, StratifiedKFold]
   n_fold: 5
-  shuffle_seed: 0
   precision: 16
   stochastic_weight_avg: False
-  epochs: 25
+  epochs: 50
+  accumulate_grad_batches: 1
   steps_per_epoch: -1 # must be set in script
 
 model:
@@ -28,7 +28,8 @@ model:
   multisample_dropout: 5
   multisample_dropout_rate: 0.5
   params:
-    hidden_dropout_prob: 0.0
+    hidden_dropout_prob: 0.00
+    layer_norm_eps: 1.0e-07
 
 loader:
   train:
@@ -46,13 +47,19 @@ loader:
 
 tokenizer:
   name: ${model.name}
-  max_length: 384
+  max_length: 314
+
+loss:
+  name: SmoothL1Loss # [MSELoss, SmoothL1Loss]
+  params: 
+    reduction: mean
+    beta: 0.25 # SmoothL1Loss
 
 optimizer:
-  name: Adam # [SGD, Adam, AdamW]
+  name: AdamW # [SGD, Adam, AdamW]
   params:
-    lr: 1.0e-08
-    # weight_decay: 1.0e-02 # AdamW
+    lr: 1.0e-16
+    weight_decay: 1.0e-02 # AdamW
 
 scheduler:
   name: OneCycleLR # [ReduceLROnPlateau, CosineAnealingLR, CosineAnnealingWarmRestarts, OneCycleLR]
@@ -67,6 +74,7 @@ scheduler:
     # T_0: ${training.steps_per_epoch} # CosineAnnealingWarmRestarts
     # T_mult: 2 # CosineAnnealingWarmRestarts
     # eta_min: 1.0e-8 # CosineAnealingLR, CosineAnnealingWarmRestarts
+
     max_lr: 2.0e-05 # OneCycleLR
     pct_start: 0.2 # OneCycleLR
     steps_per_epoch: ${training.steps_per_epoch} # OneCycleLR

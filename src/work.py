@@ -20,6 +20,7 @@ import mlflow
 import numpy as np
 import pandas as pd
 import pytorch_lightning as pl
+from pytorch_lightning.core.saving import CHECKPOINT_PAST_HPARAMS_KEYS
 import seaborn as sns
 import torch
 import transformers
@@ -45,7 +46,7 @@ def preprocess_df(df):
     df["target"] = df["target"].astype(np.float32)
     df = df.loc[
         ~((df["target"] == 0) & (df["standard_error"] == 0))
-    ].reset_index(drop=True).sort_values("id")
+    ].sort_values("id").reset_index(drop=True)
     return df
 
 # ====================================================
@@ -100,18 +101,30 @@ class Transform():
 
     def get_transform_fn(self):
         def transform(text):
-            tokens = self.tokenizer(
+            tokens = self.tokenizer.encode_plus(
                 text,
                 truncation=True,
-                max_length=self.tokenizer_max_length
+                padding="max_length",
+                pad_to_max_length=True,
+                max_length=self.tokenizer_max_length,
             )
             return tokens
 
         return transform
 
     def get_collate_fn(self):
-        return transformers.DataCollatorWithPadding(self.tokenizer)
+        return None
 
+# ====================================================
+# loss
+# ====================================================
+
+
+def get_loss(loss_name, loss_params):
+    return getattr(
+        torch.nn,
+        loss_name
+    )(**loss_params)
 
 # ====================================================
 # optimizer
@@ -160,7 +173,10 @@ class DatasetBase(torch.utils.data.Dataset):
     ):
         text = self.texts[idx]
         if self.transform:
-            return self.transform(text)
+            text = self.transform(text)
+            text = {k: torch.tensor(v, dtype=torch.long)
+                    for k, v in text.items()}
+            return text
         return {"text": text}
 
 
@@ -179,9 +195,8 @@ class Dataset(DatasetBase):
         idx,
     ):
         text = super().__getitem__(idx)
-        label = self.labels[idx]
-        text.update({"label": label})
-        return text
+        label = label = torch.tensor(self.labels[idx]).float()
+        return text, label
 
 
 class TestDataset(DatasetBase):
@@ -223,22 +238,16 @@ class BaseModel(nn.Module):
             basemodel_name,
             config=config,
         )
-        self.middle_layer_norm = nn.LayerNorm(config.hidden_size)
-        self.middle_linear = nn.Linear(
-            config.hidden_size, config.hidden_size // 2
-        )
-        self.layer_norm = nn.LayerNorm(config.hidden_size // 2)
+        self.layer_norm = nn.LayerNorm(config.hidden_size, eps=1e-07)
         self.dropouts = nn.ModuleList([
             nn.Dropout(multisample_dropout_rate) for _ in range(multisample_dropout)
         ])
         self.regressors = nn.ModuleList([
-            nn.Linear(config.hidden_size // 2, 1) for _ in range(multisample_dropout)
+            nn.Linear(config.hidden_size, 1) for _ in range(multisample_dropout)
         ])
 
     def forward(self, x):
         output = self.model(**x)[1]
-        output = self.middle_layer_norm(output)
-        output = F.relu(self.middle_linear(output))
         output = self.layer_norm(output)
         logits = torch.stack(
             [
@@ -255,6 +264,8 @@ class Model(pl.LightningModule):
         multisample_dropout: int,
         multisample_dropout_rate: float,
         model_params: dict,
+        loss_name: str,
+        loss_params: dict,
         optimizer_name: str,
         optimizer_params: dict,
         scheduler_name: str,
@@ -279,7 +290,7 @@ class Model(pl.LightningModule):
         self.scheduler_interval = scheduler_interval
 
         # critetria
-        self.criterion = torch.nn.MSELoss()
+        self.criterion = get_loss(loss_name, loss_params)
 
         # metrics
         self.train_rmse = RMSE()
@@ -302,33 +313,26 @@ class Model(pl.LightningModule):
             optimizer_name=self.optimizer_name,
             optimizer_params=self.optimizer_params,
         )
-        scheduler = get_scheduler(
-            optimizer,
-            scheduler_name=self.scheduler_name,
-            scheduler_params=self.scheduler_params,
-        )
+        if self.scheduler_name is None:
+            return {"optimizer": optimizer, }
+        else:
+            scheduler = get_scheduler(
+                optimizer,
+                scheduler_name=self.scheduler_name,
+                scheduler_params=self.scheduler_params,
+            )
 
-        return {
-            "optimizer": optimizer,
-            "lr_scheduler": {
-                "scheduler": scheduler,
-                "interval": self.scheduler_interval,
+            return {
+                "optimizer": optimizer,
+                "lr_scheduler": {
+                    "scheduler": scheduler,
+                    "monitor": "valid_rmse",
+                    "interval": self.scheduler_interval,
+                }
             }
-        }
-
-    @staticmethod
-    def split_batch(batch):
-        x = {}
-        y = {}
-        for k in batch.keys():
-            if k == "labels":
-                y = batch[k]
-            else:
-                x.update({k: batch[k]})
-        return x, y
 
     def training_step(self, batch, batch_idx):
-        x, y = self.split_batch(batch)
+        x, y = batch
         y_hat = self(x)
         loss = self.criterion(y_hat, y)
         self.train_rmse(y_hat, y)
@@ -346,7 +350,7 @@ class Model(pl.LightningModule):
         return loss
 
     def validation_step(self, batch, batch_idx):
-        x, y = self.split_batch(batch)
+        x, y = batch
         y_hat = self(x)
         loss = self.criterion(y_hat, y)
         self.valid_rmse(y_hat, y)
@@ -429,9 +433,9 @@ def plot_training_curve(train_history, valid_history, filename):
     plt.close()
 
 
-def plot_lr_scheduler(lr_history, filename, steps_per_epoch):
+def plot_lr_scheduler(lr_history, filename, steps_per_epoch, accumulate_grad_batches):
     epoch_index = [
-        step for step in range(len(lr_history)) if step % steps_per_epoch == 0
+        step for step in range(len(lr_history)) if step % (steps_per_epoch * accumulate_grad_batches) == 0
     ]
     plt.figure()
     plt.plot(range(len(lr_history)), lr_history)
@@ -496,10 +500,122 @@ def inference(
     df["target"] = prediction
     return df
 
+# ====================================================
+# train fold
+# ====================================================
+
+
+def train_fold(
+    fold,
+    train_texts,
+    train_labels,
+    train_idx,
+    valid_idx,
+    logger,
+    CFG
+):
+    print("#" * 30, f"fold: {fold}", "#" * 30)
+    # device
+    device_params = detect_device()
+
+    model = Model(
+        basemodel_name=CFG.model.name,
+        multisample_dropout=CFG.model.multisample_dropout,
+        multisample_dropout_rate=CFG.model.multisample_dropout_rate,
+        model_params=CFG.model.params,
+        loss_name=CFG.loss.name,
+        loss_params=CFG.loss.params,
+        optimizer_name=CFG.optimizer.name,
+        optimizer_params=CFG.optimizer.params,
+        scheduler_name=CFG.scheduler.name,
+        scheduler_params=CFG.scheduler.params,
+        scheduler_interval=CFG.scheduler.interval,
+    )
+
+    transform_train = Transform(
+        data="train",
+        tokenizer_name=CFG.tokenizer.name,
+        tokenizer_max_length=CFG.tokenizer.max_length,
+    )
+
+    train_dataloader = get_dataloader(
+        texts=train_texts[train_idx],
+        labels=train_labels[train_idx],
+        transform=transform_train.get_transform_fn(),
+        collate_fn=transform_train.get_collate_fn(),
+        loader_params=CFG.loader.train,
+    )
+    valid_dataloader = get_dataloader(
+        texts=train_texts[valid_idx],
+        labels=train_labels[valid_idx],
+        transform=transform_train.get_transform_fn(),
+        collate_fn=transform_train.get_collate_fn(),
+        loader_params=CFG.loader.train,
+    )
+
+    CHECKPOINT_NAME = \
+        f"fold{fold}_{CFG.model.name}_""{epoch:02d}_{valid_rmse:.3f}"
+    checkpoint_callback = pl.callbacks.ModelCheckpoint(
+        filename=CHECKPOINT_NAME,
+        monitor='valid_rmse',
+        mode='min',
+        save_top_k=1,
+        save_weights_only=True,
+    )
+
+    CFG.training.steps_per_epoch = (
+        len(train_dataloader) + CFG.training.accumulate_grad_batches - 1
+    ) // CFG.training.accumulate_grad_batches
+
+    trainer = pl.Trainer(
+        max_epochs=CFG.training.epochs,
+        logger=logger,
+        benchmark=True,
+        deterministic=True,
+        callbacks=[checkpoint_callback],
+        num_sanity_val_steps=0,
+        accumulate_grad_batches=CFG.training.accumulate_grad_batches,
+        precision=CFG.training.precision,
+        stochastic_weight_avg=CFG.training.stochastic_weight_avg,
+        **device_params,
+    )
+
+    trainer.fit(
+        model,
+        train_dataloader=train_dataloader,
+        val_dataloaders=valid_dataloader,
+    )
+
+    del train_dataloader, valid_dataloader, trainer, transform_train
+    gc.collect()
+    torch.cuda.empty_cache()
+    pl.utilities.memory.garbage_collection_cuda()
+
+    plot_training_curve(
+        model.history["train_rmse"],
+        model.history["valid_rmse"],
+        filename=f"training_curve_fold{fold}.png"
+    )
+
+    plot_lr_scheduler(
+        model.history["lr"],
+        filename=f"lr_scheduler_fold{fold}.png",
+        steps_per_epoch=CFG.training.steps_per_epoch,
+        accumulate_grad_batches=CFG.training.accumulate_grad_batches,
+    )
+
+    model.load_state_dict(
+        torch.load(checkpoint_callback.best_model_path)["state_dict"],
+    )
+
+    model.freeze()
+    model.eval()
+
+    return model
+
 
 def main(CFG):
     os.chdir(CFG.dir.work_dir)
-
     # seed
     pl.seed_everything(CFG.general.seed)
 
@@ -531,118 +647,35 @@ def main(CFG):
     train_labels = train_df["target"].values
 
     # train
-    oof_df_ls = []
+    oof_df = pd.DataFrame()
 
+    # fold
     kf = eval(CFG.training.splitter)(
         CFG.training.n_fold,
         shuffle=True,
-        random_state=CFG.training.shuffle_seed,
+        random_state=CFG.general.seed,
     )
-    for fold, (train_idx, valid_idx) in enumerate(
-        kf.split(
-            train_df, pd.cut(train_df["target"], 5 *
-                             CFG.training.n_fold).cat.codes
-        )
-    ):
-        print("#" * 30, f"fold: {fold}", "#" * 30)
+    fold_x = train_texts
+    fold_y = pd.cut(train_labels, 30).codes
 
-        model = Model(
-            basemodel_name=CFG.model.name,
-            multisample_dropout=CFG.model.multisample_dropout,
-            multisample_dropout_rate=CFG.model.multisample_dropout_rate,
-            model_params=CFG.model.params,
-            optimizer_name=CFG.optimizer.name,
-            optimizer_params=CFG.optimizer.params,
-            scheduler_name=CFG.scheduler.name,
-            scheduler_params=CFG.scheduler.params,
-            scheduler_interval=CFG.scheduler.interval,
-        )
-
-        transform_train = Transform(
-            data="train",
-            tokenizer_name=CFG.tokenizer.name,
-            tokenizer_max_length=CFG.tokenizer.max_length,
-        )
-
-        train_dataloader = get_dataloader(
-            texts=train_texts[train_idx],
-            labels=train_labels[train_idx],
-            transform=transform_train.get_transform_fn(),
-            collate_fn=transform_train.get_collate_fn(),
-            loader_params=CFG.loader.train,
-        )
-        valid_dataloader = get_dataloader(
-            texts=train_texts[valid_idx],
-            labels=train_labels[valid_idx],
-            transform=transform_train.get_transform_fn(),
-            collate_fn=transform_train.get_collate_fn(),
-            loader_params=CFG.loader.train,
-        )
-
-        CHECKPOINT_NAME = \
-            f"fold{fold}_{CFG.model.name}_""{epoch:02d}_{valid_rmse:.2f}"
-        checkpoint_callback = pl.callbacks.ModelCheckpoint(
-            filename=CHECKPOINT_NAME,
-            monitor='valid_rmse',
-            mode='min',
-            save_top_k=1,
-            save_weights_only=True,
-        )
-
-        CFG.training.steps_per_epoch = len(train_dataloader)
-
-        trainer = pl.Trainer(
-            max_epochs=CFG.training.epochs,
+    for fold, (train_idx, valid_idx) in enumerate(kf.split(fold_x, fold_y)):
+        model = train_fold(
+            fold,
+            train_texts,
+            train_labels,
+            train_idx,
+            valid_idx,
             logger=MLFLOW_LOGGER,
-            callbacks=[checkpoint_callback],
-            num_sanity_val_steps=0,
-            precision=CFG.training.precision,
-            stochastic_weight_avg=CFG.training.stochastic_weight_avg,
-            **device_params,
+            CFG=CFG
         )
-
-        trainer.fit(
-            model,
-            train_dataloader=train_dataloader,
-            val_dataloaders=valid_dataloader,
-        )
-
-        plot_training_curve(
-            model.history["train_rmse"],
-            model.history["valid_rmse"],
-            filename=f"training_curve_fold{fold}.png"
-        )
-
-        plot_lr_scheduler(
-            model.history["lr"],
-            filename=f"lr_scheduler_fold{fold}.png",
-            steps_per_epoch=CFG.training.steps_per_epoch
-        )
-
-        del trainer, model, train_dataloader, valid_dataloader
-        gc.collect()
-        torch.cuda.empty_cache()
-        pl.utilities.memory.garbage_collection_cuda()
 
         predict_trainer = pl.Trainer(
             precision=CFG.training.precision,
             logger=None,
+            callbacks=None,
+
             **device_params,
         )
-        model = Model.load_from_checkpoint(
-            checkpoint_path=checkpoint_callback.best_model_path,
-            basemodel_name=CFG.model.name,
-            multisample_dropout=CFG.model.multisample_dropout,
-            multisample_dropout_rate=CFG.model.multisample_dropout_rate,
-            model_params=CFG.model.params,
-            optimizer_name=None,
-            optimizer_params=None,
-            scheduler_name=None,
-            scheduler_params=None,
-            scheduler_interval=None,
-        )
-        model.eval()
-        model.freeze()
 
         oof_ids = train_df["id"].values[valid_idx]
         oof_texts = train_df["excerpt"].values[valid_idx]
@@ -656,14 +689,16 @@ def main(CFG):
             loader_params=CFG.loader.test,
         )
 
-        oof_df_ls.append(oof_prediction)
+        oof_df = pd.concat([oof_df, oof_prediction], axis=0)
 
-        del predict_trainer, model
+        del predict_trainer, model, oof_ids, oof_texts
         gc.collect()
         torch.cuda.empty_cache()
         pl.utilities.memory.garbage_collection_cuda()
 
-    oof_df = pd.concat(oof_df_ls, axis=0).sort_values("id")
+    oof_df = oof_df.groupby("id").mean().reset_index(drop=False)
+    oof_df.sort_values("id", inplace=True)
+    oof_df.reset_index(drop=True, inplace=True)
     oof_df.to_csv("oof.csv", index=False)
 
     validation_score = mean_squared_error(
