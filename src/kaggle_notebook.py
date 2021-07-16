@@ -7,12 +7,17 @@ CFG = OmegaConf.load(
 
 CFG.general.update(
     {
-        "seed": 7,
+        "seed": 101,
     }
 )
-CFG.loss.params.update(
+CFG.optimizer.params.update(
     {
-        "beta": 0.1,
+        "lr": 2e-05
+    }
+)
+CFG.scheduler.params.update(
+    {
+        "max_lr": 1e-03
     }
 )
 

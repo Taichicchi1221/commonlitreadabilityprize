@@ -7,7 +7,7 @@ log:
     experiment_name: baseline
 
 general:
-  seed: 6
+  seed: 101
   debug: False
 
 dir:
@@ -19,7 +19,7 @@ training:
   n_fold: 5
   precision: 16
   stochastic_weight_avg: False
-  epochs: 50
+  epochs: 15
   accumulate_grad_batches: 1
   steps_per_epoch: -1 # must be set in script
 
@@ -30,6 +30,7 @@ model:
   params:
     hidden_dropout_prob: 0.00
     layer_norm_eps: 1.0e-07
+
 
 loader:
   train:
@@ -50,19 +51,19 @@ tokenizer:
   max_length: 314
 
 loss:
-  name: SmoothL1Loss # [MSELoss, SmoothL1Loss]
+  name: MSELoss # [MSELoss, SmoothL1Loss]
   params: 
     reduction: mean
-    beta: 0.25 # SmoothL1Loss
+    # beta: 0.50 # SmoothL1Loss
 
 optimizer:
   name: AdamW # [SGD, Adam, AdamW]
   params:
-    lr: 1.0e-16
+    lr: 1.0e-8
     weight_decay: 1.0e-02 # AdamW
 
 scheduler:
-  name: OneCycleLR # [ReduceLROnPlateau, CosineAnealingLR, CosineAnnealingWarmRestarts, OneCycleLR]
+  name: OneCycleLR # [None, ReduceLROnPlateau, CosineAnealingLR, CosineAnnealingWarmRestarts, OneCycleLR]
   interval: step # [epoch, step]
   params:
     # mode: min # ReduceLROnPlateau

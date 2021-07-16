@@ -9,6 +9,7 @@ import string
 import shutil
 import sys
 import time
+import glob
 from typing import Callable
 import warnings
 from functools import partial
@@ -238,16 +239,23 @@ class BaseModel(nn.Module):
             basemodel_name,
             config=config,
         )
-        self.layer_norm = nn.LayerNorm(config.hidden_size, eps=1e-07)
+        self.middle_layer_norm = nn.LayerNorm(config.hidden_size, eps=1e-07)
+        self.middle_linear = torch.nn.utils.weight_norm(
+            nn.Linear(
+                config.hidden_size, config.hidden_size // 2
+            )
+        )
+        self.layer_norm = nn.LayerNorm(config.hidden_size // 2, eps=1e-07)
         self.dropouts = nn.ModuleList([
             nn.Dropout(multisample_dropout_rate) for _ in range(multisample_dropout)
         ])
         self.regressors = nn.ModuleList([
-            nn.Linear(config.hidden_size, 1) for _ in range(multisample_dropout)
+            torch.nn.utils.weight_norm(nn.Linear(config.hidden_size // 2, 1)) for _ in range(multisample_dropout)
         ])
 
     def forward(self, x):
         output = self.model(**x)[1]
+        output = F.relu(self.middle_linear(self.middle_layer_norm(output)))
         output = self.layer_norm(output)
         logits = torch.stack(
             [
@@ -613,6 +621,75 @@ def train_fold(
 
     return model
 
+# ====================================================
+# for kaggle notebook inference
+# ====================================================
+
+
+def inference_main(CFG, checkpoint_paths):
+    os.chdir(CFG.dir.work_dir)
+    # seed
+    pl.seed_everything(CFG.general.seed)
+
+    # device
+    device_params = detect_device()
+
+    pl.seed_everything(CFG.general.seed)
+    test_df = pd.read_csv(
+        os.path.join(
+            CFG.dir.input_dir,
+            "test.csv"
+        )
+    )
+    test_ids = test_df["id"].values
+    test_texts = test_df["excerpt"].values
+
+    predict_trainer = pl.Trainer(
+        precision=CFG.training.precision,
+        logger=None,
+        **device_params,
+    )
+
+    predictions_df = pd.DataFrame()
+
+    for checkpoint_path in checkpoint_paths:
+
+        model = Model.load_from_checkpoint(
+            checkpoint_path,
+            basemodel_name=CFG.model.name,
+            multisample_dropout=CFG.model.multisample_dropout,
+            multisample_dropout_rate=CFG.model.multisample_dropout_rate,
+            model_params=CFG.model.params,
+            loss_name=CFG.loss.name,
+            loss_params=CFG.loss.params,
+            optimizer_name=CFG.optimizer.name,
+            optimizer_params=CFG.optimizer.params,
+            scheduler_name=CFG.scheduler.name,
+            scheduler_params=CFG.scheduler.params,
+            scheduler_interval=CFG.scheduler.interval,
+        )
+
+        model.freeze()
+        model.eval()
+
+        prediction = inference(
+            test_ids,
+            test_texts,
+            trainer=predict_trainer,
+            model=model,
+            tokenizer_name=CFG.tokenizer.name,
+            tokenizer_max_length=CFG.tokenizer.max_length,
+            loader_params=CFG.loader.test,
+        )
+
+        predictions_df = pd.concat([predictions_df, prediction], axis=0)
+
+    predictions_df = \
+        predictions_df.groupby("id").mean().reset_index(drop=False)
+    predictions_df.sort_values("id", inplace=True)
+    predictions_df.reset_index(drop=True, inplace=True)
+    predictions_df.to_csv("submission.csv", index=False)
+
 
 def main(CFG):
     os.chdir(CFG.dir.work_dir)
@@ -730,11 +807,26 @@ def main(CFG):
             MLFLOW_LOGGER._run_id, f"lr_scheduler_fold{fold}.png"
         )
 
+    # inference check
+    CHECKPOINT_PATHS = glob.glob(
+        os.path.join(
+            CFG.log.mlflow.save_dir,
+            MLFLOW_LOGGER.experiment_id,
+            MLFLOW_LOGGER._run_id,
+            "checkpoints",
+            "*.ckpt"
+        )
+    )
+
+    # check inference main
+    inference_main(CFG, CHECKPOINT_PATHS)
+
 
 if __name__ == "__main__":
     CFG = OmegaConf.load(
         "/workspaces/commonlitreadabilityprize/config/config.yaml"
     )
     main(CFG)
+
 
 # %%
