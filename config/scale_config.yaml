@@ -4,11 +4,12 @@
 log:
   mlflow:
     save_dir: ../mlruns
-    experiment_name: experiments
+    experiment_name: baseline
 
 general:
-  seed: 8
+  seed: 102
   debug: True
+
 
 dir:
   work_dir: /workspaces/commonlitreadabilityprize/work
@@ -19,18 +20,18 @@ training:
   n_fold: 5
   precision: 16
   stochastic_weight_avg: False
-  epochs: 25
+  epochs: 15
   accumulate_grad_batches: 1
   steps_per_epoch: -1 # must be set in script
 
 model:
   name: roberta-base
-  hidden_features: 512 # hidden features of Attention
-  multi_dropout_rate: 0.5
-  multi_dropout_num: 5
+  multisample_dropout: 5
+  multisample_dropout_rate: 0.5
   params:
     hidden_dropout_prob: 0.00
     layer_norm_eps: 1.0e-07
+
 
 loader:
   train:
@@ -57,14 +58,10 @@ loss:
     # beta: 0.50 # SmoothL1Loss
 
 optimizer:
-  name: Lamb # [SGD, Adam, AdamW, Lamb]
+  name: AdamW # [SGD, Adam, AdamW]
   params:
     lr: 1.0e-8
-    weight_decay: 1.0e-02 # AdamW, Lamb
-    adam: True # Lamb
-    betas: [0.9, 0.999] # Lamb
-    eps: 1.0e-06 # Lamb
-    debias: False # Lamb
+    weight_decay: 1.0e-02 # AdamW
 
 scheduler:
   name: OneCycleLR # [None, ReduceLROnPlateau, CosineAnealingLR, CosineAnnealingWarmRestarts, OneCycleLR]

@@ -1,0 +1,7 @@
+### note ###
+やりたいこと
+
+・Lamb
+・head with attention architecture
+・GBDT stacking with / without more extracted features(length, tf-idf, count, etc...)
+・

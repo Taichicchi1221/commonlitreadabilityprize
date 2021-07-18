@@ -1,39 +1,39 @@
 # %%
 import gc
-import glob
 import json
-import math
 import os
 import pickle
 import random
 import re
-import shutil
 import string
+import shutil
 import sys
 import time
+import glob
+from typing import Callable
 import warnings
 from functools import partial
 from pathlib import Path
-from typing import Callable
 
+from omegaconf import OmegaConf
 import matplotlib.pyplot as plt
 import mlflow
 import numpy as np
 import pandas as pd
 import pytorch_lightning as pl
+from pytorch_lightning.core.saving import CHECKPOINT_PAST_HPARAMS_KEYS
 import seaborn as sns
 import torch
-import torchmetrics
 import transformers
-from omegaconf import OmegaConf
-from pytorch_lightning.core.saving import CHECKPOINT_PAST_HPARAMS_KEYS
 from sklearn.metrics import mean_squared_error
 from sklearn.model_selection import KFold, StratifiedKFold
 from torch import nn
 from torch.nn import functional as F
 from torch.optim import optimizer
 from torch.utils.data import DataLoader
+import torchmetrics
 from tqdm import tqdm
+from sklearn.preprocessing import QuantileTransformer
 
 warnings.simplefilter("ignore")
 
@@ -133,123 +133,7 @@ def get_loss(loss_name, loss_params):
 # ====================================================
 
 
-class Lamb(torch.optim.Optimizer):
-    # Reference code: https://github.com/cybertronai/pytorch-lamb
-
-    def __init__(
-        self,
-        params,
-        lr: float = 1e-3,
-        betas=(0.9, 0.999),
-        eps: float = 1e-6,
-        weight_decay: float = 0,
-        clamp_value: float = 10,
-        adam: bool = False,
-        debias: bool = False,
-    ):
-        if lr <= 0.0:
-            raise ValueError('Invalid learning rate: {}'.format(lr))
-        if eps < 0.0:
-            raise ValueError('Invalid epsilon value: {}'.format(eps))
-        if not 0.0 <= betas[0] < 1.0:
-            raise ValueError(
-                'Invalid beta parameter at index 0: {}'.format(betas[0])
-            )
-        if not 0.0 <= betas[1] < 1.0:
-            raise ValueError(
-                'Invalid beta parameter at index 1: {}'.format(betas[1])
-            )
-        if weight_decay < 0:
-            raise ValueError(
-                'Invalid weight_decay value: {}'.format(weight_decay)
-            )
-        if clamp_value < 0.0:
-            raise ValueError('Invalid clamp value: {}'.format(clamp_value))
-
-        defaults = dict(lr=lr, betas=betas, eps=eps, weight_decay=weight_decay)
-        self.clamp_value = clamp_value
-        self.adam = adam
-        self.debias = debias
-
-        super(Lamb, self).__init__(params, defaults)
-
-    def step(self, closure=None):
-        loss = None
-        if closure is not None:
-            loss = closure()
-
-        for group in self.param_groups:
-            for p in group['params']:
-                if p.grad is None:
-                    continue
-                grad = p.grad.data
-                if grad.is_sparse:
-                    msg = (
-                        'Lamb does not support sparse gradients, '
-                        'please consider SparseAdam instead'
-                    )
-                    raise RuntimeError(msg)
-
-                state = self.state[p]
-
-                # State initialization
-                if len(state) == 0:
-                    state['step'] = 0
-                    # Exponential moving average of gradient values
-                    state['exp_avg'] = torch.zeros_like(
-                        p, memory_format=torch.preserve_format
-                    )
-                    # Exponential moving average of squared gradient values
-                    state['exp_avg_sq'] = torch.zeros_like(
-                        p, memory_format=torch.preserve_format
-                    )
-
-                exp_avg, exp_avg_sq = state['exp_avg'], state['exp_avg_sq']
-                beta1, beta2 = group['betas']
-
-                state['step'] += 1
-
-                # Decay the first and second moment running average coefficient
-                # m_t
-                exp_avg.mul_(beta1).add_(grad, alpha=1 - beta1)
-                # v_t
-                exp_avg_sq.mul_(beta2).addcmul_(grad, grad, value=1 - beta2)
-
-                # Paper v3 does not use debiasing.
-                if self.debias:
-                    bias_correction = math.sqrt(1 - beta2 ** state['step'])
-                    bias_correction /= 1 - beta1 ** state['step']
-                else:
-                    bias_correction = 1
-
-                # Apply bias to lr to avoid broadcast.
-                step_size = group['lr'] * bias_correction
-
-                weight_norm = torch.norm(p.data).clamp(0, self.clamp_value)
-
-                adam_step = exp_avg / exp_avg_sq.sqrt().add(group['eps'])
-                if group['weight_decay'] != 0:
-                    adam_step.add_(p.data, alpha=group['weight_decay'])
-
-                adam_norm = torch.norm(adam_step)
-                if weight_norm == 0 or adam_norm == 0:
-                    trust_ratio = 1
-                else:
-                    trust_ratio = weight_norm / adam_norm
-                state['weight_norm'] = weight_norm
-                state['adam_norm'] = adam_norm
-                state['trust_ratio'] = trust_ratio
-                if self.adam:
-                    trust_ratio = 1
-
-                p.data.add_(adam_step, alpha=-step_size * trust_ratio)
-
-        return loss
-
-
 def get_optimizer(model, optimizer_name, optimizer_params):
-    if optimizer_name == "Lamb":
-        return Lamb(model.parameters(), **optimizer_params)
     return getattr(
         torch.optim,
         optimizer_name
@@ -337,59 +221,13 @@ class TestDataset(DatasetBase):
 # ====================================================
 
 
-class MultiDropout(nn.Module):
-    def __init__(
-        self,
-        in_features,
-        out_features,
-        multi_dropout_rate=0.5,
-        multi_dropout_num=5,
-    ):
-        super().__init__()
-
-        self.dropouts = nn.ModuleList([
-            nn.Dropout(multi_dropout_rate) for _ in range(multi_dropout_num)
-        ])
-        self.regressors = nn.ModuleList([
-            nn.Linear(in_features, out_features) for _ in range(multi_dropout_num)
-        ])
-
-    def forward(self, x):
-        output = torch.stack(
-            [
-                regressor(dropout(x)) for regressor, dropout in zip(self.regressors, self.dropouts)
-            ]
-        ).mean(axis=0)
-        return output
-
-
-class Attention(nn.Module):
-    def __init__(
-        self,
-        in_features,
-        hidden_features,
-    ):
-        super().__init__()
-        self.attention = nn.Sequential(
-            nn.Linear(in_features, hidden_features),
-            nn.Tanh(),
-            nn.Linear(hidden_features, 1),
-            nn.Softmax(dim=1)
-        )
-
-    def forward(self, x):
-        weights = self.attention(x)
-        return torch.sum(weights * x, dim=1)
-
-
 class BaseModel(nn.Module):
     def __init__(
         self,
         basemodel_name: str,
-        hidden_features: int,
-        multi_dropout_rate: float,
-        multi_dropout_num: int,
-        model_params: dict,
+        multisample_dropout: int,
+        multisample_dropout_rate: float,
+        model_params,
     ):
         super().__init__()
 
@@ -398,39 +236,43 @@ class BaseModel(nn.Module):
             basemodel_name
         )
         config.update(model_params)
-        config.update({"output_hidden_states": True})
         self.model = transformers.AutoModel.from_pretrained(
             basemodel_name,
             config=config,
         )
-
-        self.head = nn.Sequential(
-            Attention(
-                in_features=config.hidden_size,
-                hidden_features=hidden_features,
-            ),
-            MultiDropout(
-                in_features=config.hidden_size,
-                out_features=1,
-                multi_dropout_rate=multi_dropout_rate,
-                multi_dropout_num=multi_dropout_num,
+        self.middle_layer_norm = nn.LayerNorm(config.hidden_size, eps=1e-07)
+        self.middle_linear = torch.nn.utils.weight_norm(
+            nn.Linear(
+                config.hidden_size, config.hidden_size // 2
             )
         )
+        self.layer_norm = nn.LayerNorm(config.hidden_size // 2, eps=1e-07)
+        self.dropouts = nn.ModuleList([
+            nn.Dropout(multisample_dropout_rate) for _ in range(multisample_dropout)
+        ])
+        self.regressors = nn.ModuleList([
+            torch.nn.utils.weight_norm(nn.Linear(config.hidden_size // 2, 1)) for _ in range(multisample_dropout)
+        ])
 
     def forward(self, x):
-        output = self.model(**x).hidden_states[-1]
-        output = self.head(output)
-        return output.squeeze(1)
+        output = self.model(**x)[1]
+        output = F.relu(self.middle_linear(self.middle_layer_norm(output)))
+        output = self.layer_norm(output)
+        logits = torch.stack(
+            [
+                regressor(dropout(output)) for regressor, dropout in zip(self.regressors, self.dropouts)
+            ]
+        ).mean(axis=0)
+        return logits.flatten()
 
 
 class Model(pl.LightningModule):
     def __init__(
         self,
         basemodel_name: str,
+        multisample_dropout: int,
+        multisample_dropout_rate: float,
         model_params: dict,
-        hidden_features: int,
-        multi_dropout_rate: float,
-        multi_dropout_num: int,
         loss_name: str,
         loss_params: dict,
         optimizer_name: str,
@@ -444,9 +286,8 @@ class Model(pl.LightningModule):
         # model
         self.model = BaseModel(
             basemodel_name=basemodel_name,
-            hidden_features=hidden_features,
-            multi_dropout_rate=multi_dropout_rate,
-            multi_dropout_num=multi_dropout_num,
+            multisample_dropout=multisample_dropout,
+            multisample_dropout_rate=multisample_dropout_rate,
             model_params=model_params,
         )
 
@@ -688,9 +529,8 @@ def train_fold(
 
     model = Model(
         basemodel_name=CFG.model.name,
-        hidden_features=CFG.model.hidden_features,
-        multi_dropout_rate=CFG.model.multi_dropout_rate,
-        multi_dropout_num=CFG.model.multi_dropout_num,
+        multisample_dropout=CFG.model.multisample_dropout,
+        multisample_dropout_rate=CFG.model.multisample_dropout_rate,
         model_params=CFG.model.params,
         loss_name=CFG.loss.name,
         loss_params=CFG.loss.params,
@@ -722,7 +562,8 @@ def train_fold(
         loader_params=CFG.loader.train,
     )
 
-    CHECKPOINT_NAME = f"fold{fold}_{CFG.model.name}_""{epoch:02d}_{valid_rmse:.3f}"
+    CHECKPOINT_NAME = \
+        f"fold{fold}_{CFG.model.name}_""{epoch:02d}_{valid_rmse:.3f}"
     checkpoint_callback = pl.callbacks.ModelCheckpoint(
         filename=CHECKPOINT_NAME,
         monitor='valid_rmse',
@@ -753,8 +594,6 @@ def train_fold(
         train_dataloader=train_dataloader,
         val_dataloaders=valid_dataloader,
     )
-
-    print(f"best model path: {checkpoint_callback.best_model_path}")
 
     del train_dataloader, valid_dataloader, trainer, transform_train
     gc.collect()
@@ -810,7 +649,7 @@ def inference_main(CFG, checkpoint_paths):
     test_ids = test_df["id"].values
     test_texts = test_df["excerpt"].values
 
-    trainer = pl.Trainer(
+    predict_trainer = pl.Trainer(
         precision=CFG.training.precision,
         logger=None,
         **device_params,
@@ -823,9 +662,8 @@ def inference_main(CFG, checkpoint_paths):
         model = Model.load_from_checkpoint(
             checkpoint_path,
             basemodel_name=CFG.model.name,
-            hidden_features=CFG.model.hidden_features,
-            multi_dropout_rate=CFG.model.multi_dropout_rate,
-            multi_dropout_num=CFG.model.multi_dropout_num,
+            multisample_dropout=CFG.model.multisample_dropout,
+            multisample_dropout_rate=CFG.model.multisample_dropout_rate,
             model_params=CFG.model.params,
             loss_name=CFG.loss.name,
             loss_params=CFG.loss.params,
@@ -842,7 +680,7 @@ def inference_main(CFG, checkpoint_paths):
         prediction = inference(
             test_ids,
             test_texts,
-            trainer=trainer,
+            trainer=predict_trainer,
             model=model,
             tokenizer_name=CFG.tokenizer.name,
             tokenizer_max_length=CFG.tokenizer.max_length,
@@ -851,16 +689,12 @@ def inference_main(CFG, checkpoint_paths):
 
         predictions_df = pd.concat([predictions_df, prediction], axis=0)
 
-    predictions_df = predictions_df.groupby(
-        "id").mean().reset_index(drop=False)
+    predictions_df = \
+        predictions_df.groupby("id").mean().reset_index(drop=False)
     predictions_df.sort_values("id", inplace=True)
     predictions_df.reset_index(drop=True, inplace=True)
     predictions_df.to_csv("submission.csv", index=False)
 
-
-# ====================================================
-# main
-# ====================================================
 
 def main(CFG):
     os.chdir(CFG.dir.work_dir)
@@ -891,8 +725,12 @@ def main(CFG):
         save_dir=CFG.log.mlflow.save_dir,
     )
 
+    qt = QuantileTransformer(1000, output_distribution="normal")
+
     train_texts = train_df["excerpt"].values
-    train_labels = train_df["target"].values
+    train_labels = qt.fit_transform(
+        train_df["target"].values.reshape(-1, 1)
+    ).reshape(-1, )
 
     # train
     oof_df = pd.DataFrame()
@@ -988,12 +826,13 @@ def main(CFG):
         )
     )
 
+    # check inference main
     inference_main(CFG, CHECKPOINT_PATHS)
 
 
 if __name__ == "__main__":
     CFG = OmegaConf.load(
-        "/workspaces/commonlitreadabilityprize/config/config.yaml"
+        "/workspaces/commonlitreadabilityprize/config/scale_config.yaml"
     )
     main(CFG)
 
