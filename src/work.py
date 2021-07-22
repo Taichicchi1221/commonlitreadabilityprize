@@ -109,8 +109,11 @@ class Transform():
                 padding="max_length",
                 pad_to_max_length=True,
                 max_length=self.tokenizer_max_length,
+                return_token_type_ids=False,
+                return_attention_mask=True,
+                return_tensors="pt"
             )
-            return tokens
+            return {key: val.squeeze(0) for key, val in tokens.items()}
 
         return transform
 
@@ -292,10 +295,8 @@ class DatasetBase(torch.utils.data.Dataset):
         text = self.texts[idx]
         if self.transform:
             text = self.transform(text)
-            text = {k: torch.tensor(v, dtype=torch.long)
-                    for k, v in text.items()}
             return text
-        return {"text": text}
+        return text
 
 
 class Dataset(DatasetBase):
@@ -350,8 +351,15 @@ class MultiDropout(nn.Module):
         self.dropouts = nn.ModuleList([
             nn.Dropout(multi_dropout_rate) for _ in range(multi_dropout_num)
         ])
+        linears = [
+            nn.Linear(in_features, out_features)
+            for i in range(multi_dropout_num)
+        ]
+        for l in linears:
+            nn.init.constant_(l.bias, -1.0)
+
         self.regressors = nn.ModuleList([
-            nn.Linear(in_features, out_features) for _ in range(multi_dropout_num)
+            linears[i] for i in range(multi_dropout_num)
         ])
 
     def forward(self, x):
@@ -382,6 +390,26 @@ class Attention(nn.Module):
         return torch.sum(weights * x, dim=1)
 
 
+class MeanPooling(nn.Module):
+    def __init__(self, hidden_size):
+        super().__init__()
+        self.layer_norm = nn.LayerNorm(hidden_size)
+        self.linear = nn.Linear(hidden_size, 1)
+        nn.init.constant_(self.linear.bias, -1.0)
+
+    def forward(self, last_hidden_state, attention_mask):
+        input_mask_expanded = attention_mask.unsqueeze(
+            -1).expand(last_hidden_state.size()).float()
+        sum_embeddings = torch.sum(last_hidden_state * input_mask_expanded, 1)
+        sum_mask = input_mask_expanded.sum(1)
+        sum_mask = torch.clamp(sum_mask, min=1e-9)
+        mean_embeddings = sum_embeddings / sum_mask
+        norm_mean_embeddings = self.layer_norm(mean_embeddings)
+        logits = self.linear(norm_mean_embeddings).squeeze(-1)
+
+        return logits
+
+
 class BaseModel(nn.Module):
     def __init__(
         self,
@@ -389,6 +417,7 @@ class BaseModel(nn.Module):
         hidden_features: int,
         multi_dropout_rate: float,
         multi_dropout_num: int,
+        freeze_embeddings: bool,
         model_params: dict,
     ):
         super().__init__()
@@ -404,23 +433,31 @@ class BaseModel(nn.Module):
             config=config,
         )
 
-        self.head = nn.Sequential(
-            Attention(
-                in_features=config.hidden_size,
-                hidden_features=hidden_features,
-            ),
-            MultiDropout(
-                in_features=config.hidden_size,
-                out_features=1,
-                multi_dropout_rate=multi_dropout_rate,
-                multi_dropout_num=multi_dropout_num,
-            )
-        )
+        if freeze_embeddings:
+            self.model.embeddings.requires_grad_(False)
+
+        # self.head = nn.Sequential(
+        #     nn.LayerNorm(config.hidden_size),
+        #     Attention(
+        #         in_features=config.hidden_size,
+        #         hidden_features=hidden_features,
+        #     ),
+        #     # nn.LayerNorm(config.hidden_size),
+        #     MultiDropout(
+        #         in_features=config.hidden_size,
+        #         out_features=1,
+        #         multi_dropout_rate=multi_dropout_rate,
+        #         multi_dropout_num=multi_dropout_num,
+        #     )
+        # )
+
+        self.mean_pooling = MeanPooling(config.hidden_size)
 
     def forward(self, x):
-        output = self.model(**x).hidden_states[-1]
-        output = self.head(output)
-        return output.squeeze(1)
+        last_hidden_state = self.model(**x).hidden_states[-1]
+        # output = self.head(last_hidden_state)
+        output = self.mean_pooling(last_hidden_state, x["attention_mask"])
+        return output.squeeze(-1)
 
 
 class Model(pl.LightningModule):
@@ -431,6 +468,7 @@ class Model(pl.LightningModule):
         hidden_features: int,
         multi_dropout_rate: float,
         multi_dropout_num: int,
+        freeze_embeddings: bool,
         loss_name: str,
         loss_params: dict,
         optimizer_name: str,
@@ -447,6 +485,7 @@ class Model(pl.LightningModule):
             hidden_features=hidden_features,
             multi_dropout_rate=multi_dropout_rate,
             multi_dropout_num=multi_dropout_num,
+            freeze_embeddings=freeze_embeddings,
             model_params=model_params,
         )
 
@@ -691,6 +730,7 @@ def train_fold(
         hidden_features=CFG.model.hidden_features,
         multi_dropout_rate=CFG.model.multi_dropout_rate,
         multi_dropout_num=CFG.model.multi_dropout_num,
+        freeze_embeddings=CFG.model.freeze_embeddings,
         model_params=CFG.model.params,
         loss_name=CFG.loss.name,
         loss_params=CFG.loss.params,
@@ -826,6 +866,7 @@ def inference_main(CFG, checkpoint_paths):
             hidden_features=CFG.model.hidden_features,
             multi_dropout_rate=CFG.model.multi_dropout_rate,
             multi_dropout_num=CFG.model.multi_dropout_num,
+            freeze_embeddings=CFG.model.freeze_embeddings,
             model_params=CFG.model.params,
             loss_name=CFG.loss.name,
             loss_params=CFG.loss.params,
