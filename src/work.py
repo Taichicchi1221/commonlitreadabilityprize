@@ -35,6 +35,7 @@ from torch.optim import optimizer
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
 warnings.simplefilter("ignore")
 
 # %%
@@ -77,6 +78,15 @@ class RMSE(torchmetrics.Metric):
     def compute(self):
         return torch.sqrt(self.sum_squared_errors / self.n_observations)
 
+
+# ====================================================
+# split
+# ====================================================
+class ContinuousStratifiedKFold(StratifiedKFold):
+    def split(selfself, x, y, groups=None):
+        num_bins = int(np.floor(1 + np.log2(len(y))))
+        bins = pd.cut(y, bins=num_bins, labels=False)
+        return super().split(x, bins, groups)
 
 # ====================================================
 # transform
@@ -387,7 +397,7 @@ class Attention(nn.Module):
 
     def forward(self, x):
         weights = self.attention(x)
-        return torch.sum(weights * x, dim=1)
+        return torch.sum(weights * x, dim=1).squeeze(-1)
 
 
 class MeanPooling(nn.Module):
@@ -405,7 +415,7 @@ class MeanPooling(nn.Module):
         sum_mask = torch.clamp(sum_mask, min=1e-9)
         mean_embeddings = sum_embeddings / sum_mask
         norm_mean_embeddings = self.layer_norm(mean_embeddings)
-        logits = self.linear(norm_mean_embeddings).squeeze(-1)
+        logits = self.linear(norm_mean_embeddings).squeeze(-1).squeeze(-1)
 
         return logits
 
@@ -427,37 +437,41 @@ class BaseModel(nn.Module):
             basemodel_name
         )
         config.update(model_params)
-        config.update({"output_hidden_states": True})
         self.model = transformers.AutoModel.from_pretrained(
             basemodel_name,
             config=config,
         )
 
-        if freeze_embeddings:
+        self.freeze_embeddings = freeze_embeddings
+        self.model.requires_grad_(False)
+
+        self.head = nn.Sequential(
+            nn.LayerNorm(config.hidden_size),
+            Attention(
+                in_features=config.hidden_size,
+                hidden_features=hidden_features,
+            ),
+            # nn.LayerNorm(config.hidden_size),
+            MultiDropout(
+                in_features=config.hidden_size,
+                out_features=1,
+                multi_dropout_rate=multi_dropout_rate,
+                multi_dropout_num=multi_dropout_num,
+            )
+        )
+
+        # self.mean_pooling = MeanPooling(config.hidden_size)
+
+    def unfreeze(self):
+        self.model.requires_grad_(True)
+        if self.freeze_embeddings:
             self.model.embeddings.requires_grad_(False)
 
-        # self.head = nn.Sequential(
-        #     nn.LayerNorm(config.hidden_size),
-        #     Attention(
-        #         in_features=config.hidden_size,
-        #         hidden_features=hidden_features,
-        #     ),
-        #     # nn.LayerNorm(config.hidden_size),
-        #     MultiDropout(
-        #         in_features=config.hidden_size,
-        #         out_features=1,
-        #         multi_dropout_rate=multi_dropout_rate,
-        #         multi_dropout_num=multi_dropout_num,
-        #     )
-        # )
-
-        self.mean_pooling = MeanPooling(config.hidden_size)
-
     def forward(self, x):
-        last_hidden_state = self.model(**x).hidden_states[-1]
-        # output = self.head(last_hidden_state)
-        output = self.mean_pooling(last_hidden_state, x["attention_mask"])
-        return output.squeeze(-1)
+        last_hidden_state = self.model(**x)["last_hidden_state"]
+        output = self.head(last_hidden_state)
+        # output = self.mean_pooling(last_hidden_state, x["attention_mask"])
+        return output
 
 
 class Model(pl.LightningModule):
@@ -541,8 +555,8 @@ class Model(pl.LightningModule):
     def training_step(self, batch, batch_idx):
         x, y = batch
         y_hat = self(x)
-        loss = self.criterion(y_hat, y)
-        self.train_rmse(y_hat, y)
+        loss = self.criterion(y_hat, y.squeeze(-1))
+        self.train_rmse(y_hat, y.squeeze(-1))
         self.log(
             name="train_rmse",
             value=self.train_rmse,
@@ -559,8 +573,8 @@ class Model(pl.LightningModule):
     def validation_step(self, batch, batch_idx):
         x, y = batch
         y_hat = self(x)
-        loss = self.criterion(y_hat, y)
-        self.valid_rmse(y_hat, y)
+        loss = self.criterion(y_hat, y.squeeze(-1))
+        self.valid_rmse(y_hat, y.squeeze(-1))
         self.log(
             name="valid_rmse",
             value=self.valid_rmse,
@@ -726,7 +740,7 @@ def train_fold(
     device_params = detect_device()
 
     model = Model(
-        basemodel_name=CFG.model.name,
+        basemodel_name=CFG.model.path,
         hidden_features=CFG.model.hidden_features,
         multi_dropout_rate=CFG.model.multi_dropout_rate,
         multi_dropout_num=CFG.model.multi_dropout_num,
@@ -768,12 +782,36 @@ def train_fold(
         monitor='valid_rmse',
         mode='min',
         save_top_k=1,
+        save_last=True,
         save_weights_only=True,
     )
+    checkpoint_callback.CHECKPOINT_NAME_LAST = f"fold{fold}_{CFG.model.name}_""last_{valid_rmse:.3f}"
 
     CFG.training.steps_per_epoch = (
         len(train_dataloader) + CFG.training.accumulate_grad_batches - 1
     ) // CFG.training.accumulate_grad_batches
+
+    trainer = pl.Trainer(
+        max_epochs=CFG.training.epochs,
+        logger=logger,
+        benchmark=True,
+        deterministic=True,
+        callbacks=None,
+        checkpoint_callback=False,
+        num_sanity_val_steps=0,
+        accumulate_grad_batches=CFG.training.accumulate_grad_batches,
+        precision=CFG.training.precision,
+        stochastic_weight_avg=CFG.training.stochastic_weight_avg,
+        **device_params,
+    )
+
+    trainer.fit(
+        model,
+        train_dataloader=train_dataloader,
+        val_dataloaders=valid_dataloader,
+    )
+
+    model.model.unfreeze()
 
     trainer = pl.Trainer(
         max_epochs=CFG.training.epochs,
@@ -850,15 +888,14 @@ def inference_main(CFG, checkpoint_paths):
     test_ids = test_df["id"].values
     test_texts = test_df["excerpt"].values
 
-    trainer = pl.Trainer(
-        precision=CFG.training.precision,
-        logger=None,
-        **device_params,
-    )
-
     predictions_df = pd.DataFrame()
 
     for checkpoint_path in checkpoint_paths:
+        trainer = pl.Trainer(
+            precision=CFG.training.precision,
+            logger=None,
+            **device_params,
+        )
 
         model = Model.load_from_checkpoint(
             checkpoint_path,
@@ -891,6 +928,11 @@ def inference_main(CFG, checkpoint_paths):
         )
 
         predictions_df = pd.concat([predictions_df, prediction], axis=0)
+
+        del trainer, model
+        gc.collect()
+        torch.cuda.empty_cache()
+        pl.utilities.memory.garbage_collection_cuda()
 
     predictions_df = predictions_df.groupby(
         "id").mean().reset_index(drop=False)
@@ -939,13 +981,13 @@ def main(CFG):
     oof_df = pd.DataFrame()
 
     # fold
-    kf = eval(CFG.training.splitter)(
+    kf = ContinuousStratifiedKFold(
         CFG.training.n_fold,
         shuffle=True,
         random_state=CFG.general.seed,
     )
     fold_x = train_texts
-    fold_y = pd.cut(train_labels, 30).codes
+    fold_y = train_labels
 
     for fold, (train_idx, valid_idx) in enumerate(kf.split(fold_x, fold_y)):
         model = train_fold(
